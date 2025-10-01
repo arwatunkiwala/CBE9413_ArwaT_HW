@@ -1,0 +1,58 @@
+import math
+
+R = 8.314
+T0 = 298
+recovery = 0.9085
+
+N1 = 24.51 * 1000
+x1_N2 = 0.7428
+x1_O2 = 0.1200
+x1_H2O = 0.0875
+x1_CO2 = 0.0408
+x1_Ar = 0.0089
+
+CO2_in_flue = N1 * x1_CO2
+CO2_captured = recovery * CO2_in_flue
+CO2_remaining = CO2_in_flue - CO2_captured
+
+N3 = CO2_captured
+N2 = N1 - N3
+
+x2_N2 = (N1 * x1_N2) / N2
+x2_O2 = (N1 * x1_O2) / N2
+x2_H2O = (N1 * x1_H2O) / N2
+x2_Ar = (N1 * x1_Ar) / N2
+x2_CO2 = CO2_remaining / N2
+
+Hf = {'N2': 0, 'O2': 0, 'H2O_g': -241826, 'CO2': -393520, 'Ar': 0}
+S0 = {'N2': 191.61, 'O2': 205.15, 'H2O_g': 188.835, 'CO2': 213.78, 'Ar': 154.846}
+
+H_inlet = N1 * (x1_N2*Hf['N2'] + x1_O2*Hf['O2'] + x1_H2O*Hf['H2O_g'] + x1_CO2*Hf['CO2'] + x1_Ar*Hf['Ar'])
+H_product = N3 * Hf['CO2']
+H_residual = N2 * (x2_N2*Hf['N2'] + x2_O2*Hf['O2'] + x2_H2O*Hf['H2O_g'] + x2_CO2*Hf['CO2'] + x2_Ar*Hf['Ar'])
+delta_H = (H_product + H_residual) - H_inlet
+
+S0_inlet = x1_N2*S0['N2'] + x1_O2*S0['O2'] + x1_H2O*S0['H2O_g'] + x1_CO2*S0['CO2'] + x1_Ar*S0['Ar']
+sum_x_ln_x_inlet = sum(x*math.log(x) for x in [x1_N2, x1_O2, x1_H2O, x1_CO2, x1_Ar])
+S_inlet = N1 * (S0_inlet - R * sum_x_ln_x_inlet)
+
+S_product = N3 * S0['CO2']
+
+S0_residual = x2_N2*S0['N2'] + x2_O2*S0['O2'] + x2_H2O*S0['H2O_g'] + x2_CO2*S0['CO2'] + x2_Ar*S0['Ar']
+sum_x_ln_x_residual = sum(x*math.log(x) for x in [x2_N2, x2_O2, x2_H2O, x2_CO2, x2_Ar])
+S_residual = N2 * (S0_residual - R * sum_x_ln_x_residual)
+
+delta_S = (S_product + S_residual) - S_inlet
+W_min = delta_H - T0 * delta_S
+W_per_mol_CO2 = W_min / CO2_captured
+
+print("TASK B - GENERIC SEPARATION")
+print("="*50)
+print(f"ΔH: {delta_H/1e6:.2f} MW")
+print(f"ΔS: {delta_S/1e3:.2f} kW/K")
+print(f"T₀·ΔS: {T0*delta_S/1e6:.2f} MW")
+print(f"\nMinimum work: {W_min/1e6:.2f} MW")
+print(f"\nCO2 captured: {CO2_captured/1000:.2f} kmol/s")
+print(f"Work per mol CO2: {W_per_mol_CO2/1000:.2f} kJ/mol")
+print(f"Work per tonne CO2: {W_per_mol_CO2 * 1000/44 / 1000:.2f} MJ/tonne")
+print(f"Work per tonne CO2: {W_per_mol_CO2 * 1000/44 / 3600:.2f} kWh/tonne")
