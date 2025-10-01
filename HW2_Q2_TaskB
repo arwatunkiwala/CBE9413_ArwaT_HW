@@ -1,0 +1,489 @@
+import pandas as pd
+import numpy as np
+import networkx as nx
+import matplotlib.pyplot as plt
+from collections import deque
+from haversine import haversine, Unit
+
+# --- CONSTANTS ---
+GALLONS_PER_BARREL = 42
+BTU_PER_GALLON = 12194
+BTU_PER_MJ = 947.817
+BIOMASS_LHV = 18.6  # MJ/kg dry basis
+EFFICIENCY = 0.50
+DAYS_PER_YEAR = 365
+KG_PER_TONNE = 1000
+
+# Transport constants
+FUEL_EFFICIENCY = 1.5  # MJ per tonne-km
+ROAD_DISTANCE_FACTOR = 1.3  # Road distance is 1.3x Haversine distance
+
+# Moisture content scenarios
+PELLETIZED_MOISTURE = 0.08  # 8 wt%
+UNPELLETIZED_MOISTURE = 0.50  # 50 wt%
+
+FACILITY_SCALES = {
+    "150,000 barrels/day (Large)": 150000,
+    "10,000 barrels/day (Small)": 10000
+}
+
+FACILITY_LOCATIONS = {
+    "Kansas City, MO": {"fips": 29095, "lat": 39.0997, "lon": -94.5786},
+    "Pittsburgh, PA": {"fips": 42003, "lat": 40.4406, "lon": -79.9959}
+}
+
+FEED_SCENARIOS = {
+    "Pelletized (8 wt%)": PELLETIZED_MOISTURE,
+    "Unpelletized (50 wt%)": UNPELLETIZED_MOISTURE
+}
+
+# DATA FILES
+BIOMASS_FILES = [
+    "billionton_23_agri_mm-med.csv",
+    "billionton_23_forestry_mm-med.csv",
+    "billionton_23_wastes_mm-med.csv"
+]
+ADJACENCY_FILE = "county_adjacency_matrix.csv"
+CENTROIDS_FILE = "US_Counties_Centroids.csv"
+
+
+def calculate_required_biomass_dry(barrels_per_day):
+    """Calculate DRY biomass required in tonnes/year"""
+    energy_output_btu_day = barrels_per_day * GALLONS_PER_BARREL * BTU_PER_GALLON
+    energy_output_mj_day = energy_output_btu_day / BTU_PER_MJ
+    energy_input_mj_day = energy_output_mj_day / EFFICIENCY
+    biomass_mass_kg_day = energy_input_mj_day / BIOMASS_LHV
+    biomass_mass_tonnes_year = biomass_mass_kg_day * DAYS_PER_YEAR / KG_PER_TONNE
+    return biomass_mass_tonnes_year
+
+
+def calculate_wet_biomass(dry_biomass_tonnes, moisture_content):
+    """
+    Convert dry biomass to wet biomass given moisture content.
+    Wet mass = Dry mass / (1 - moisture fraction)
+    """
+    return dry_biomass_tonnes / (1 - moisture_content)
+
+
+def load_county_centroids():
+    """Load county centroid coordinates (lat/lon)"""
+    print("\n" + "="*70)
+    print("LOADING COUNTY CENTROIDS")
+    print("="*70)
+    
+    df = pd.read_csv(CENTROIDS_FILE, low_memory=False)
+    print(f"✓ Loaded {len(df)} rows")
+    print(f"  Columns: {list(df.columns)}")
+    
+    # Find required columns
+    fips_col = None
+    lat_col = None
+    lon_col = None
+    
+    for col in df.columns:
+        col_lower = col.lower()
+        if 'fips' in col_lower or 'geoid' in col_lower:
+            fips_col = col
+        if 'lat' in col_lower and not lon_col:
+            lat_col = col
+        if ('lon' in col_lower or 'lng' in col_lower) and 'lat' not in col_lower:
+            lon_col = col
+    
+    if not all([fips_col, lat_col, lon_col]):
+        raise ValueError(f"Could not find required columns. Available: {list(df.columns)}")
+    
+    print(f"  Using: FIPS='{fips_col}', LAT='{lat_col}', LON='{lon_col}'")
+    
+    df = df[[fips_col, lat_col, lon_col]].copy()
+    df.columns = ['FIPS', 'LAT', 'LON']
+    
+    df['FIPS'] = pd.to_numeric(df['FIPS'], errors='coerce')
+    df['LAT'] = pd.to_numeric(df['LAT'], errors='coerce')
+    df['LON'] = pd.to_numeric(df['LON'], errors='coerce')
+    df = df.dropna()
+    df['FIPS'] = df['FIPS'].astype(int)
+    
+    # Remove duplicates
+    df = df.drop_duplicates(subset=['FIPS'], keep='first')
+    df = df.reset_index(drop=True)
+    
+    print(f"✓ Processed {len(df)} unique county centroids")
+    return df
+
+
+def load_biomass_data():
+    """Load biomass production data (dry tonnes/year)"""
+    print("\n" + "="*70)
+    print("LOADING BIOMASS DATA")
+    print("="*70)
+    
+    all_data = []
+    
+    for filename in BIOMASS_FILES:
+        source = filename.split('_')[2].split('.')[0]
+        print(f"\n  Loading {source}...", end=" ")
+        
+        try:
+            df = pd.read_csv(filename, low_memory=False)
+            
+            # Find required columns
+            fips_col = None
+            prod_col = None
+            
+            for col in df.columns:
+                col_lower = col.lower()
+                if 'fips' in col_lower or 'geoid' in col_lower:
+                    fips_col = col
+                if 'production' in col_lower or 'biomass' in col_lower:
+                    prod_col = col
+            
+            if not fips_col or not prod_col:
+                print(f"✗ Missing columns")
+                print(f"   Available columns: {list(df.columns)}")
+                continue
+            
+            print(f"Using columns: {fips_col}, {prod_col}")
+            
+            df = df[[fips_col, prod_col]].copy()
+            df.columns = ['FIPS', 'biomass']
+            
+            df['FIPS'] = pd.to_numeric(df['FIPS'], errors='coerce')
+            df['biomass'] = pd.to_numeric(df['biomass'], errors='coerce')
+            
+            df = df.dropna()
+            df = df[df['biomass'] > 0]
+            df['FIPS'] = df['FIPS'].astype(int)
+            
+            print(f" → {len(df)} records, {df['biomass'].sum():,.0f} tonnes/year")
+            all_data.append(df)
+            
+        except Exception as e:
+            print(f"✗ Error: {e}")
+    
+    if not all_data:
+        print("\n✗ No biomass data loaded!")
+        return None
+    
+    df_combined = pd.concat(all_data, ignore_index=True)
+    df_result = df_combined.groupby('FIPS', as_index=False)['biomass'].sum()
+    df_result.rename(columns={'biomass': 'biomass_tonnes'}, inplace=True)
+    
+    print(f"\n✓ Total: {len(df_result)} counties, {df_result['biomass_tonnes'].sum():,.0f} tonnes/year")
+    return df_result
+
+
+def load_adjacency_matrix():
+    """Load adjacency matrix and build graph"""
+    print("\n" + "="*70)
+    print("LOADING ADJACENCY MATRIX")
+    print("="*70)
+    
+    df_adj = pd.read_csv(ADJACENCY_FILE, index_col=0, low_memory=False)
+    
+    df_adj.index = pd.to_numeric(df_adj.index, errors='coerce')
+    df_adj = df_adj[df_adj.index.notna()]
+    df_adj.index = df_adj.index.astype(int)
+    
+    df_adj.columns = pd.to_numeric(df_adj.columns, errors='coerce')
+    valid_cols = df_adj.columns.notna()
+    df_adj = df_adj.loc[:, valid_cols]
+    df_adj.columns = df_adj.columns.astype(int)
+    
+    df_adj = df_adj.apply(pd.to_numeric, errors='coerce').fillna(0)
+    
+    G = nx.Graph()
+    for county_i in df_adj.index:
+        for county_j in df_adj.columns:
+            if county_i < county_j and df_adj.at[county_i, county_j] == 1:
+                G.add_edge(county_i, county_j)
+    
+    print(f"✓ Graph: {G.number_of_nodes()} nodes, {G.number_of_edges()} edges")
+    return G
+
+
+def bfs_collect_counties(start_fips, required_tonnes, df_biomass, graph):
+    """
+    BFS to collect adjacent counties until biomass requirement is met.
+    Returns list of county FIPS codes.
+    """
+    biomass_dict = df_biomass.set_index('FIPS')['biomass_tonnes'].to_dict()
+    
+    # Check if start county exists
+    if start_fips not in graph:
+        print(f"  Warning: Start FIPS {start_fips} not in graph")
+        return []
+    
+    queue = deque([start_fips])
+    visited = {start_fips}
+    total_biomass = 0.0
+    counties_used = []
+    
+    while queue and total_biomass < required_tonnes:
+        current = queue.popleft()
+        
+        # Add this county's biomass if it exists
+        if current in biomass_dict:
+            biomass = biomass_dict[current]
+            total_biomass += biomass
+            counties_used.append(current)
+        
+        # If we've collected enough, stop
+        if total_biomass >= required_tonnes:
+            break
+        
+        # Add adjacent counties to queue
+        if current in graph:
+            for neighbor in graph.neighbors(current):
+                if neighbor not in visited:
+                    visited.add(neighbor)
+                    queue.append(neighbor)
+    
+    return counties_used
+
+
+def calculate_transport_fuel(counties_list, county_biomass, county_coords, facility_coords, moisture_content):
+    """
+    Calculate total fuel required to transport biomass from counties to facility.
+    
+    For each county:
+    1. Get the county's biomass (dry tonnes)
+    2. Convert to wet tonnes based on moisture content
+    3. Calculate haversine distance from county centroid to facility
+    4. Multiply by road factor (1.3x)
+    5. Calculate fuel: distance × wet_mass × fuel_efficiency
+    """
+    total_fuel_mj = 0.0
+    details = []
+    
+    fac_lat, fac_lon = facility_coords
+    
+    for fips in counties_list:
+        # Skip if missing data
+        if fips not in county_coords or fips not in county_biomass:
+            continue
+        
+        # Get county coordinates
+        county_lat, county_lon = county_coords[fips]
+        
+        # Calculate Haversine distance (km)
+        haversine_dist_km = haversine(
+            (county_lat, county_lon), 
+            (fac_lat, fac_lon), 
+            unit=Unit.KILOMETERS
+        )
+        
+        # Apply road distance factor
+        road_dist_km = haversine_dist_km * ROAD_DISTANCE_FACTOR
+        
+        # Get dry biomass and convert to wet
+        dry_biomass_tonnes = county_biomass[fips]
+        wet_biomass_tonnes = calculate_wet_biomass(dry_biomass_tonnes, moisture_content)
+        
+        # Calculate fuel: distance × mass × efficiency
+        fuel_mj = road_dist_km * wet_biomass_tonnes * FUEL_EFFICIENCY
+        
+        total_fuel_mj += fuel_mj
+        
+        details.append({
+            'fips': fips,
+            'distance_km': road_dist_km,
+            'dry_biomass': dry_biomass_tonnes,
+            'wet_biomass': wet_biomass_tonnes,
+            'fuel_mj': fuel_mj
+        })
+    
+    return total_fuel_mj, details
+
+
+def run_transport_analysis():
+    """Main analysis for Task B"""
+    print("\n" + "="*80)
+    print(" TASK B: BIOMASS TRANSPORT FUEL ANALYSIS ".center(80, "="))
+    print("="*80)
+    
+    # Load data
+    df_biomass = load_biomass_data()
+    if df_biomass is None:
+        return None
+    
+    df_centroids = load_county_centroids()
+    if df_centroids is None:
+        return None
+    
+    graph = load_adjacency_matrix()
+    if graph is None:
+        return None
+    
+    # Create lookup dictionaries
+    biomass_dict = df_biomass.set_index('FIPS')['biomass_tonnes'].to_dict()
+    coords_dict = {}
+    for _, row in df_centroids.iterrows():
+        fips = int(row['FIPS'])
+        coords_dict[fips] = (float(row['LAT']), float(row['LON']))
+    
+    print(f"\n✓ Loaded: {len(biomass_dict)} counties with biomass, {len(coords_dict)} with coordinates")
+    
+    # Results storage
+    print("\n" + "="*70)
+    print("RUNNING ANALYSIS FOR ALL SCENARIOS")
+    print("="*70)
+    
+    results = []
+    
+    for location_name, location_data in FACILITY_LOCATIONS.items():
+        fips = location_data['fips']
+        fac_coords = (location_data['lat'], location_data['lon'])
+        
+        print(f"\n{'='*70}")
+        print(f"{location_name} (FIPS {fips})")
+        print('='*70)
+        
+        for scale_name, barrels_per_day in FACILITY_SCALES.items():
+            # Calculate dry biomass requirement
+            dry_biomass_required = calculate_required_biomass_dry(barrels_per_day)
+            
+            # Get counties via BFS
+            counties = bfs_collect_counties(fips, dry_biomass_required, df_biomass, graph)
+            
+            if not counties:
+                print(f"\n{scale_name}: NO COUNTIES FOUND")
+                continue
+            
+            # Calculate actual biomass collected
+            actual_biomass = sum(biomass_dict.get(c, 0) for c in counties)
+            
+            print(f"\n{scale_name}:")
+            print(f"  Dry biomass required: {dry_biomass_required:,.0f} tonnes/year")
+            print(f"  Dry biomass collected: {actual_biomass:,.0f} tonnes/year")
+            print(f"  Counties used: {len(counties)}")
+            
+            for feed_name, moisture in FEED_SCENARIOS.items():
+                # Calculate transport fuel
+                fuel_mj, details = calculate_transport_fuel(
+                    counties, biomass_dict, coords_dict, fac_coords, moisture
+                )
+                
+                fuel_gj = fuel_mj / 1000
+                wet_biomass = calculate_wet_biomass(actual_biomass, moisture)
+                
+                print(f"\n    {feed_name}:")
+                print(f"      Moisture: {moisture*100:.0f} wt%")
+                print(f"      Wet biomass: {wet_biomass:,.0f} tonnes/year")
+                print(f"      Transport fuel: {fuel_gj:,.0f} GJ/year")
+                
+                # Show sample calculation for first 3 counties
+                print(f"      Sample counties:")
+                for detail in details[:3]:
+                    print(f"        FIPS {detail['fips']}: {detail['distance_km']:.1f} km, "
+                          f"{detail['wet_biomass']:.0f} wet tonnes, "
+                          f"{detail['fuel_mj']/1000:.0f} GJ")
+                
+                results.append({
+                    'Location': location_name,
+                    'Scale': scale_name,
+                    'Feed Scenario': feed_name,
+                    'Moisture (wt%)': moisture * 100,
+                    'Dry Biomass Required (tonnes/yr)': dry_biomass_required,
+                    'Dry Biomass Collected (tonnes/yr)': actual_biomass,
+                    'Wet Biomass (tonnes/yr)': wet_biomass,
+                    'Counties Used': len(counties),
+                    'Transport Fuel (GJ/yr)': fuel_gj,
+                    'Transport Fuel (MJ/yr)': fuel_mj
+                })
+    
+    if not results:
+        print("\n✗ No results generated")
+        return None
+    
+    # Summary table
+    print("\n" + "="*70)
+    print("SUMMARY TABLE")
+    print("="*70)
+    
+    df_results = pd.DataFrame(results)
+    
+    # Format for display
+    display_df = df_results.copy()
+    for col in ['Dry Biomass Required (tonnes/yr)', 'Dry Biomass Collected (tonnes/yr)', 
+                'Wet Biomass (tonnes/yr)', 'Transport Fuel (GJ/yr)']:
+        display_df[col] = display_df[col].apply(lambda x: f"{x:,.0f}")
+    
+    print("\n", display_df.to_string(index=False))
+    
+    # Save results
+    df_results.to_csv('transport_fuel_results.csv', index=False)
+    print("\n✓ Results saved to 'transport_fuel_results.csv'")
+    
+    # Visualization
+    print("\n" + "="*70)
+    print("GENERATING VISUALIZATION")
+    print("="*70)
+    
+    fig, axes = plt.subplots(2, 2, figsize=(16, 12))
+    fig.suptitle('Transport Fuel Requirements by Scenario', fontsize=16, fontweight='bold')
+    
+    locations = list(FACILITY_LOCATIONS.keys())
+    scales = list(FACILITY_SCALES.keys())
+    
+    for idx, location_name in enumerate(locations):
+        for jdx, scale_name in enumerate(scales):
+            ax = axes[idx, jdx]
+            
+            data = df_results[
+                (df_results['Location'] == location_name) & 
+                (df_results['Scale'] == scale_name)
+            ]
+            
+            if len(data) == 0:
+                ax.text(0.5, 0.5, 'No Data', ha='center', va='center', fontsize=14)
+                ax.set_title(f"{location_name}\n{scale_name}", fontsize=11, fontweight='bold')
+                continue
+            
+            scenarios = data['Feed Scenario'].values
+            fuel_gj = data['Transport Fuel (GJ/yr)'].values
+            
+            bars = ax.bar(range(len(scenarios)), fuel_gj, 
+                         color=['#2ecc71', '#e74c3c'], 
+                         edgecolor='black', linewidth=1.5, alpha=0.8)
+            
+            ax.set_title(f"{location_name}\n{scale_name}", fontsize=11, fontweight='bold')
+            ax.set_ylabel('Transport Fuel (GJ/year)', fontsize=10)
+            ax.set_xticks(range(len(scenarios)))
+            ax.set_xticklabels(scenarios, rotation=15, ha='right', fontsize=9)
+            ax.grid(axis='y', alpha=0.3, linestyle='--')
+            
+            for bar in bars:
+                height = bar.get_height()
+                ax.text(bar.get_x() + bar.get_width()/2, height,
+                       f'{height:,.0f}',
+                       ha='center', va='bottom', fontsize=9, fontweight='bold')
+    
+    plt.tight_layout()
+    plt.savefig('transport_fuel_analysis.png', dpi=300, bbox_inches='tight')
+    print("✓ Figure saved to 'transport_fuel_analysis.png'")
+    plt.show()
+    
+    # Key takeaways
+    print("\n" + "="*70)
+    print("KEY TAKEAWAYS")
+    print("="*70)
+    
+    print("\n1. MOISTURE CONTENT IMPACT:")
+    for location in locations:
+        for scale in scales:
+            data = df_results[(df_results['Location'] == location) & (df_results['Scale'] == scale)]
+            if len(data) == 2:
+                pellet = data[data['Feed Scenario'].str.contains('Pelletized')].iloc[0]
+                unpellet = data[data['Feed Scenario'].str.contains('Unpelletized')].iloc[0]
+                ratio = unpellet['Transport Fuel (GJ/yr)'] / pellet['Transport Fuel (GJ/yr)']
+                print(f"   {location}, {scale}:")
+                print(f"     Unpelletized: {unpellet['Transport Fuel (GJ/yr)']:,.0f} GJ/yr")
+                print(f"     Pelletized: {pellet['Transport Fuel (GJ/yr)']:,.0f} GJ/yr")
+                print(f"     Ratio: {ratio:.2f}x more fuel for unpelletized")
+    
+    print("\n✓ ANALYSIS COMPLETE!")
+    return df_results
+
+
+if __name__ == "__main__":
+    results = run_transport_analysis()
