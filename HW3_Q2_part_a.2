@@ -1,0 +1,201 @@
+using JuMP
+using Gurobi
+using DataFrames
+using CSV
+using Statistics
+
+ENV["GRB_LICENSE_FILE"] = "/content/gurobi.lic"
+
+# ============================================================================
+# Wind Turbine Capacity Optimization Model - CASE 2
+# Locations: 1, 2, 4, 5 (excluding Location 3)
+# ============================================================================
+
+locations = Dict(
+    1 => "Nolan County, TX",
+    2 => "Blaine/Kingfisher County, OK",
+    4 => "Murray County, MN",
+    5 => "Lee County, IL"
+)
+
+location_ids = [1, 2, 4, 5]  # Case 2: Skip location 3
+
+turbine_models = Dict(
+    1 => (name="Gamesa G126-2.5MW/100m", rated_power=2.5),
+    2 => (name="GE Vernova 1.6 MW", rated_power=1.6),
+    3 => (name="Vestas 1.8 MW", rated_power=1.8)
+)
+
+# Load capacity factor curves
+println("Loading capacity factor curves...")
+cf_curves = Dict()
+
+cf_curves[1] = DataFrame(CSV.File("/content/sample_data/gamesa_g126_cf_curve.csv"))
+println("✓ Loaded Gamesa G126 capacity factor curve")
+
+cf_curves[2] = DataFrame(CSV.File("/content/sample_data/vernova_1.6_cf_curve.csv"))
+println("✓ Loaded GE Vernova 1.6 capacity factor curve")
+
+cf_curves[3] = DataFrame(CSV.File("/content/sample_data/vestas_v100_cf_curve.csv"))
+println("✓ Loaded Vestas 1.8 capacity factor curve")
+
+# Load wind speed data - ONLY for locations 1, 2, 4, 5
+println("\nLoading wind speed data for CASE 2 locations (1,2,4,5)...")
+wind_speed_data = Dict()
+
+file_locations = Dict(
+    1 => "/content/drive/My Drive/wind_data/wind_100m_32.4_-100.6_2010.csv",
+    2 => "/content/drive/My Drive/wind_data/wind_100m_35.7_-98.7_2010.csv",
+    4 => "/content/drive/My Drive/wind_data/wind_100m_43.0_-96.0_2010.csv",
+    5 => "/content/drive/My Drive/wind_data/wind_100m_41.7_-89.1_2010.csv"
+)
+
+for (loc_id, filename) in file_locations
+    lines = readlines(filename)
+    data_lines = lines[3:end]
+    
+    wind_speeds = Float64[]
+    
+    for line in data_lines
+        parts = split(line, ',')
+        
+        if length(parts) >= 6
+            try
+                ws = parse(Float64, strip(parts[6]))
+                push!(wind_speeds, ws)
+            catch e
+                println("Warning: Could not parse wind speed from line: $line")
+            end
+        end
+    end
+    
+    wind_speed_data[loc_id] = wind_speeds
+    
+    println("✓ Location $loc_id: $(length(wind_speed_data[loc_id])) hours, range $(round(minimum(wind_speed_data[loc_id]), digits=1))-$(round(maximum(wind_speed_data[loc_id]), digits=1)) m/s")
+end
+
+num_hours = length(wind_speed_data[1])
+println("\nTotal hours: $num_hours")
+
+# Capacity factor interpolation function
+function get_capacity_factor(wind_speed::Float64, turbine_id::Int64)::Float64
+    df = cf_curves[turbine_id]
+    cols = names(df)
+    wind_speeds = Float64.(df[:, cols[1]])
+    capacity_factors = Float64.(df[:, cols[2]])
+    
+    if wind_speed < wind_speeds[1]
+        return 0.0
+    elseif wind_speed >= wind_speeds[end]
+        return capacity_factors[end]
+    else
+        idx = searchsortedlast(wind_speeds, wind_speed)
+        if idx == 0
+            return capacity_factors[1]
+        elseif idx >= length(wind_speeds)
+            return capacity_factors[end]
+        else
+            ws1, ws2 = wind_speeds[idx], wind_speeds[idx+1]
+            cf1, cf2 = capacity_factors[idx], capacity_factors[idx+1]
+            return ws2 == ws1 ? cf1 : cf1 + (wind_speed - ws1) / (ws2 - ws1) * (cf2 - cf1)
+        end
+    end
+end
+
+# Pre-compute capacity factors - ONLY for locations 1,2,4,5
+println("\nPre-computing capacity factors...")
+cf_data = Dict()
+for loc in location_ids, turbine in 1:3, h in 1:num_hours
+    cf_data[(loc, turbine, h)] = get_capacity_factor(wind_speed_data[loc][h], turbine)
+end
+println("✓ Done")
+
+# Check feasibility
+println("\nChecking feasibility...")
+max_turbines = 2000
+infeasible_count = 0
+for h in 1:num_hours
+    max_gen = sum(max_turbines * turbine_models[t].rated_power * cf_data[(l, t, h)] for l in location_ids, t in 1:3)
+    if max_gen < 100.0
+        infeasible_count += 1
+        if infeasible_count <= 5
+            println("  Hour $h: max possible = $(round(max_gen, digits=1)) MW")
+        end
+    end
+end
+if infeasible_count > 0
+    println("⚠ WARNING: $infeasible_count hours cannot meet 100 MW even with $max_turbines turbines/location")
+    println("Consider increasing max_turbines")
+end
+
+# Build optimization model
+println("\nBuilding optimization model...")
+model = Model(Gurobi.Optimizer)
+set_optimizer_attribute(model, "OutputFlag", 1)
+set_optimizer_attribute(model, "TimeLimit", 600)
+set_optimizer_attribute(model, "MIPGap", 0.01)
+
+@variable(model, y[loc in location_ids, 1:3], Bin)
+@variable(model, n[loc in location_ids, 1:3] >= 0, Int)
+
+@constraint(model, [loc in location_ids], sum(y[loc, t] for t in 1:3) <= 1)
+@constraint(model, [loc in location_ids, t in 1:3], n[loc, t] <= max_turbines * y[loc, t])
+@constraint(model, [h=1:num_hours], 
+    sum(n[loc, t] * turbine_models[t].rated_power * cf_data[(loc, t, h)] for loc in location_ids, t in 1:3) >= 100.0
+)
+
+@objective(model, Min, sum(n[loc, t] * turbine_models[t].rated_power for loc in location_ids, t in 1:3))
+
+println("Optimizing...")
+optimize!(model)
+
+# Results
+println("\n" * "="^80)
+println("RESULTS - CASE 2: LOCATIONS 1, 2, 4, 5")
+println("="^80)
+
+if termination_status(model) in [MOI.OPTIMAL, MOI.LOCALLY_SOLVED]
+    println("\nStatus: $(termination_status(model))")
+    println("Total Installed Capacity: $(round(objective_value(model), digits=2)) MW\n")
+    
+    results = []
+    for loc in location_ids
+        for t in 1:3
+            num_t = Int(round(value(n[loc, t])))
+            if num_t > 0
+                cap = num_t * turbine_models[t].rated_power
+                println("Location $loc ($(locations[loc])):")
+                println("  $(turbine_models[t].name): $num_t turbines, $(cap) MW")
+                push!(results, (Location=loc, LocationName=locations[loc], 
+                               TurbineModel=turbine_models[t].name, 
+                               NumberOfTurbines=num_t, TotalCapacity_MW=cap))
+            end
+        end
+    end
+    
+    # Calculate curtailment
+    println("\nCalculating curtailment...")
+    total_available = 0.0
+    total_curtailed = 0.0
+    for h in 1:num_hours
+        gen = sum(value(n[loc, t]) * turbine_models[t].rated_power * cf_data[(loc, t, h)] 
+                 for loc in location_ids, t in 1:3)
+        total_available += gen
+        total_curtailed += max(0, gen - 100.0)
+    end
+    
+    curtailment_pct = 100 * total_curtailed / total_available
+    println("Curtailed renewable energy fraction: $(round(curtailment_pct, digits=2))%")
+    
+    if !isempty(results)
+        results_df = DataFrame(results)
+        CSV.write("/content/wind_turbine_optimization_results_case2.csv", results_df)
+        println("\n✓ Results saved to wind_turbine_optimization_results_case2.csv")
+        println(results_df)
+    end
+    
+else
+    println("\n⚠ OPTIMIZATION FAILED: $(termination_status(model))")
+    println("The problem is likely infeasible. Try:")
+    println("  1. Increase max_turbines (currently $max_turbines)")
+end
