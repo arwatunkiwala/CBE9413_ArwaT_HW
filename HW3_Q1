@@ -1,0 +1,315 @@
+import requests
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.interpolate import CubicSpline
+
+# =====================================================
+# 1. DEFINE NREL API CREDENTIALS
+# =====================================================
+
+api_key = "y207jeVQlQjpV1MT5gdNgxZdbBBG1TxgsvUH5ASr"
+email = "aht3074@nyu.edu"
+full_name = "Arwa Honed Tunkiwala"
+affiliation = 'NYU'
+reason = 'research'
+year = 2010
+
+# =====================================================
+# 2. DEFINE ALL LOCATIONS
+# =====================================================
+
+locations = {
+    'Nolan County, TX': {'lat': 32.4, 'lon': -100.6},
+    'Blaine/Kingfisher County, OK': {'lat': 35.7, 'lon': -98.7},
+    'Adair County, IA': {'lat': 41.4, 'lon': -94.7},
+    'Murray County, MN': {'lat': 43.0, 'lon': -96.0},
+    'Lee County, IL': {'lat': 41.7, 'lon': -89.1}
+}
+
+# =====================================================
+# 3. DEFINE TURBINE MODELS
+# =====================================================
+
+turbines = {
+    'Gamesa G126-2.5MW': {
+        'rated_power_kw': 2500,
+        'cut_in_speed': 2.0,
+        'cut_out_speed': 21,
+        'reentry_margin': 5,
+        'turbine_loss': 0.19,
+        'cf_curve_file': 'sample_data/gamesa_g126_cf_curve.csv'
+    },
+    'GE Vernova 1.6 MW': {
+        'rated_power_kw': 1600,
+        'cut_in_speed': 3.5,
+        'cut_out_speed': 25,
+        'reentry_margin': 5,
+        'turbine_loss': 0.19,
+        'cf_curve_file': 'sample_data/vernova_1.6_cf_curve.csv'
+    },
+    'Vestas 1.8 MW': {
+        'rated_power_kw': 1800,
+        'cut_in_speed': 4.0,
+        'cut_out_speed': 25,
+        'reentry_margin': 5,
+        'turbine_loss': 0.19,
+        'cf_curve_file': 'sample_data/vestas_v100_cf_curve.csv'
+    }
+}
+
+Temperature_cutoff = 243.15
+
+# =====================================================
+# 4. FUNCTION TO DOWNLOAD AND PROCESS DATA
+# =====================================================
+
+def download_wind_data(lat, lon, year):
+    """Download wind data from NREL API"""
+    wkt = f"POINT({lon} {lat})"
+    url = 'https://developer.nrel.gov/api/wind-toolkit/v2/wind/wtk-download.csv'
+    
+    attributes = [
+        'windspeed_100m',
+        'relativehumidity_2m',
+        'temperature_100m',
+        'pressure_100m',
+    ]
+    
+    params = {
+        'api_key': api_key,
+        'wkt': wkt,
+        'names': str(year),
+        'interval': '60',
+        'utc': 'true',
+        'leap_day': 'false',
+        'email': email,
+        'full_name': full_name,
+        'affiliation': affiliation,
+        'reason': reason,
+        'attributes': ','.join(attributes)
+    }
+    
+    print(f"Downloading data for ({lat}, {lon})...")
+    response = requests.get(url, params=params)
+    
+    if response.status_code != 200:
+        print(f"✗ Error downloading data: {response.text}")
+        return None
+    
+    filename = f'wind_100m_{lat}_{lon}_{year}.csv'
+    with open(filename, 'w', encoding='utf-8') as f:
+        f.write(response.text)
+    print(f"✓ Saved to {filename}")
+    
+    return filename
+
+def process_wind_data(filename):
+    """Load and preprocess wind data"""
+    df = pd.read_csv(filename, skiprows=1)
+    
+    df.columns = [c.strip() for c in df.columns]
+    df.rename(columns={
+        'wind speed at 100m (m/s)': 'v_meas',
+        'relative humidity at 2m (%)': 'rh',
+        'air temperature at 100m (C)': 'T_C',
+        'air pressure at 100m (Pa)': 'p_meas'
+    }, inplace=True)
+    
+    # Calculate air density
+    T_K = df['T_C'] + 273.15
+    phi = df['rh'] / 100.0
+    p_water = phi * 610.78 * np.exp((17.27 * df['T_C']) / (df['T_C'] + 237.3))
+    
+    R_dry = 287.1
+    R_water = 461.5
+    n_meas = (df['p_meas'] - p_water) / (R_dry * T_K) + p_water / (R_water * T_K)
+    
+    # Correct wind speed to standard air density
+    n_std = 1.225
+    v_std = df['v_meas'] * (n_meas / n_std) ** (1/3)
+    
+    return v_std, T_K, df
+
+def calculate_turbine_output(v_std, T_K, turbine_params):
+    """Calculate turbine power output with hysteresis"""
+    rated_power_kw = turbine_params['rated_power_kw']
+    cut_in_speed = turbine_params['cut_in_speed']
+    cut_out_speed = turbine_params['cut_out_speed']
+    reentry_margin = turbine_params['reentry_margin']
+    turbine_loss = turbine_params['turbine_loss']
+    cf_curve_file = turbine_params['cf_curve_file']
+    
+    # Load power curve
+    cf_curve = pd.read_csv(cf_curve_file, sep=',')
+    spline = CubicSpline(
+        cf_curve["wind_speed"],
+        cf_curve["capacity_factor"],
+        bc_type='natural'
+    )
+    
+    # Hysteresis logic
+    first_v = v_std.iloc[0]
+    state = 1 if first_v <= cut_out_speed else 0
+    states = []
+    reentry_speed = cut_out_speed - reentry_margin
+    
+    for v in v_std:
+        if state == 1 and v > cut_out_speed:
+            state = 0
+        elif state == 0 and v < reentry_speed:
+            state = 1
+        states.append(state)
+    
+    turbine_state = pd.Series(states, index=v_std.index)
+    
+    # Calculate power output
+    power_output = pd.Series(spline(v_std), index=v_std.index)
+    power_output = power_output.clip(lower=0, upper=1)
+    power_output = power_output.where(v_std >= cut_in_speed, 0)
+    power_output = power_output.where(v_std <= cut_out_speed, 0)
+    power_output = power_output.where(T_K >= Temperature_cutoff, 0)
+    power_output = power_output * turbine_state
+    power_output = power_output * (1 - turbine_loss)
+    
+    return power_output
+
+# =====================================================
+# 5. MAIN ANALYSIS LOOP
+# =====================================================
+
+all_results = {}
+
+for location_name, coords in locations.items():
+    lat = coords['lat']
+    lon = coords['lon']
+    
+    print(f"\n{'='*70}")
+    print(f"PROCESSING: {location_name} ({lat}°N, {abs(lon)}°W)")
+    print(f"{'='*70}")
+    
+    # Download data (comment out if files already exist)
+    # filename = download_wind_data(lat, lon, year)
+    
+    # Or use existing file
+    filename = f'wind_100m_{lat}_{lon}_{year}.csv'
+    
+    try:
+        v_std, T_K, df = process_wind_data(filename)
+        location_results = []
+        
+        for turbine_name, turbine_params in turbines.items():
+            print(f"\n  Calculating: {turbine_name}")
+            
+            try:
+                cf_hourly = calculate_turbine_output(v_std, T_K, turbine_params)
+                annual_cf = cf_hourly.mean()
+                
+                # Scale for 15 MW farm
+                rated_power_kw = turbine_params['rated_power_kw']
+                num_turbines = 15000 / rated_power_kw
+                power_output_kw = cf_hourly * rated_power_kw * num_turbines
+                
+                print(f"    Annual CF: {annual_cf:.4f} ({annual_cf*100:.2f}%)")
+                print(f"    Mean Power: {power_output_kw.mean():.2f} kW")
+                
+                location_results.append({
+                    'turbine': turbine_name,
+                    'cf_hourly': cf_hourly,
+                    'annual_cf': annual_cf,
+                    'mean_power_kw': power_output_kw.mean(),
+                    'max_power_kw': power_output_kw.max()
+                })
+                
+            except FileNotFoundError:
+                print(f"    ✗ Error: File '{turbine_params['cf_curve_file']}' not found!")
+        
+        all_results[location_name] = location_results
+        
+    except FileNotFoundError:
+        print(f"✗ Error: Data file '{filename}' not found!")
+
+# =====================================================
+# 6. PLOT DURATION CURVES FOR EACH LOCATION
+# =====================================================
+
+for location_name, results in all_results.items():
+    if not results:
+        continue
+    
+    fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+    fig.suptitle(f'Capacity Factor Duration Curves - {location_name}', 
+                 fontsize=14, fontweight='bold')
+    
+    for idx, result in enumerate(results):
+        # Sort capacity factors in descending order for duration curve
+        cf_sorted = np.sort(result['cf_hourly'].values)[::-1]
+        hours = np.arange(len(cf_sorted))
+        annual_cf = result['annual_cf']
+        
+        axes[idx].plot(hours, cf_sorted, linewidth=1.5, color='steelblue', alpha=0.8)
+        axes[idx].axhline(y=annual_cf, color='red', linestyle='--',
+                         label=f'Annual CF: {annual_cf:.4f}', linewidth=2)
+        axes[idx].fill_between(hours, 0, cf_sorted, alpha=0.2, color='steelblue')
+        axes[idx].set_xlabel('Hours per Year (Sorted)', fontsize=11)
+        axes[idx].set_ylabel('Capacity Factor', fontsize=11)
+        axes[idx].set_title(f'{result["turbine"]}\n15 MW Farm',
+                           fontsize=11, fontweight='bold')
+        axes[idx].grid(True, alpha=0.3, linestyle='--')
+        axes[idx].legend(fontsize=9, loc='upper right')
+        axes[idx].set_ylim([0, 1.05])
+        axes[idx].set_xlim([0, len(cf_sorted)])
+    
+    plt.tight_layout()
+    safe_location = location_name.replace('/', '_').replace(' ', '_')
+    plt.savefig(f'duration_curve_{safe_location}_{year}.png', dpi=300, bbox_inches='tight')
+    plt.show()
+
+# =====================================================
+# 7. SUMMARY TABLE FOR ALL LOCATIONS
+# =====================================================
+
+print(f"\n{'='*90}")
+print(f"SUMMARY TABLE - ALL LOCATIONS (2010)")
+print(f"{'='*90}")
+
+summary_data = []
+for location_name, results in all_results.items():
+    for result in results:
+        summary_data.append({
+            'Location': location_name,
+            'Turbine': result['turbine'],
+            'Annual CF': f"{result['annual_cf']:.4f}",
+            'CF (%)': f"{result['annual_cf']*100:.2f}%",
+            'Mean Power (kW)': f"{result['mean_power_kw']:.2f}",
+            'Max Power (kW)': f"{result['max_power_kw']:.2f}"
+        })
+
+summary_df = pd.DataFrame(summary_data)
+print(summary_df.to_string(index=False))
+print(f"{'='*90}\n")
+
+# =====================================================
+# 8. TURBINE RECOMMENDATIONS
+# =====================================================
+
+print(f"\n{'='*90}")
+print(f"TURBINE RECOMMENDATIONS BY LOCATION")
+print(f"{'='*90}")
+
+for location_name, results in all_results.items():
+    if not results:
+        continue
+    
+    best_turbine = max(results, key=lambda x: x['annual_cf'])
+    print(f"\n{location_name}:")
+    print(f"  Recommended: {best_turbine['turbine']}")
+    print(f"  Annual CF: {best_turbine['annual_cf']:.4f} ({best_turbine['annual_cf']*100:.2f}%)")
+    print(f"  Mean Power: {best_turbine['mean_power_kw']:.2f} kW")
+    
+    # Show comparison
+    print(f"  All turbines:")
+    for r in sorted(results, key=lambda x: x['annual_cf'], reverse=True):
+        print(f"    - {r['turbine']}: CF = {r['annual_cf']:.4f}")
+
+print(f"\n{'='*90}\n")
