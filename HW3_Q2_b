@@ -1,0 +1,263 @@
+using JuMP
+using Gurobi
+using DataFrames
+using CSV
+using Statistics
+
+# ============================================================================
+# CONFIGURATION AND STATIC DATA
+# ============================================================================
+# Set Gurobi license file location
+ENV["GRB_LICENSE_FILE"] = "/content/gurobi.lic" 
+
+# Problem Constraints
+# RELAXED MAX_TURBINES to 7500 to find the true minimum capacity required for 2012.
+const MAX_TURBINES = 7500 
+const DEMAND_MW = 100.0
+const WEATHER_YEARS = [2010, 2011, 2012]
+const LOCATIONS_TO_SOLVE = [1, 2, 3, 4, 5] # All 5 locations for Part b
+
+# Location details (used for dynamic file path creation)
+const LOCATION_DETAILS = Dict(
+    1 => (name="Nolan County, TX", coords=(32.4, -100.6)),
+    2 => (name="Blaine/Kingfisher County, OK", coords=(35.7, -98.7)),
+    3 => (name="Adair County, IA", coords=(41.4, -94.7)),
+    4 => (name="Murray County, MN", coords=(43.0, -96.0)),
+    5 => (name="Lee County, IL", coords=(41.7, -89.1))
+)
+
+# Turbine Models
+const TURBINE_MODELS = Dict(
+    1 => (name="Gamesa G126-2.5MW/100m", rated_power=2.5),
+    2 => (name="GE Vernova 1.6 MW", rated_power=1.6),
+    3 => (name="Vestas 1.8 MW", rated_power=1.8)
+)
+
+# File patterns
+const WIND_FILE_PATTERN = "/content/drive/My Drive/wind_data/wind_100m_{LAT}_{LON}_{YEAR}.csv"
+const CF_CURVE_PATHS = Dict(
+    1 => "/content/sample_data/gamesa_g126_cf_curve.csv",
+    2 => "/content/sample_data/vernova_1.6_cf_curve.csv",
+    3 => "/content/sample_data/vestas_v100_cf_curve.csv"
+)
+
+# Load capacity factor curves
+println("Loading capacity factor curves...")
+cf_curves = Dict()
+try
+    cf_curves[1] = DataFrame(CSV.File(CF_CURVE_PATHS[1]))
+    cf_curves[2] = DataFrame(CSV.File(CF_CURVE_PATHS[2]))
+    cf_curves[3] = DataFrame(CSV.File(CF_CURVE_PATHS[3]))
+    println("✓ Capacity factor curves loaded successfully.")
+catch e
+    println("❌ ERROR: Failed to load Capacity Factor curves. Ensure files are present.")
+    rethrow(e)
+end
+
+# ============================================================================
+# UTILITY FUNCTIONS
+# ============================================================================
+
+"""Interpolates the capacity factor (CF) for a given wind speed."""
+function get_capacity_factor(wind_speed::Float64, turbine_id::Int64, cf_curves::Dict)::Float64
+    df = cf_curves[turbine_id]
+    # Assumes the first column is speed and the second is CF
+    wind_speeds = Float64.(df[:, 1])
+    capacity_factors = Float64.(df[:, 2])
+    
+    # Check boundaries
+    if wind_speed <= wind_speeds[1]
+        return 0.0
+    elseif wind_speed >= wind_speeds[end]
+        return capacity_factors[end]
+    else
+        # Find the interval for interpolation
+        idx = searchsortedlast(wind_speeds, wind_speed)
+        ws1, ws2 = wind_speeds[idx], wind_speeds[idx+1]
+        cf1, cf2 = capacity_factors[idx], capacity_factors[idx+1]
+        
+        # Linear interpolation
+        return ws2 == ws1 ? cf1 : cf1 + (wind_speed - ws1) / (ws2 - ws1) * (cf2 - cf1)
+    end
+end
+
+"""Loads wind speed data for all specified locations for a given year."""
+function load_wind_speed_data(location_ids::Vector{Int}, year::Int)
+    wind_speed_data = Dict()
+    println("\nLoading wind speed data for year $year...")
+    
+    for loc_id in location_ids
+        details = LOCATION_DETAILS[loc_id]
+        lat, lon = details.coords
+        
+        # Construct the file name using the dynamic pattern
+        filename = replace(WIND_FILE_PATTERN, 
+                           "{LAT}" => string(lat), 
+                           "{LON}" => string(lon), 
+                           "{YEAR}" => string(year))
+        
+        try
+            # Attempt to read the file
+            lines = readlines(filename)
+            # Assuming the CSV has 2 header lines before the data begins
+            data_lines = lines[3:end] 
+            wind_speeds = Float64[]
+            
+            for line in data_lines
+                # The wind speed value is expected at the 6th position (index 6)
+                parts = split(line, ',')
+                if length(parts) >= 6
+                    try
+                        ws = parse(Float64, strip(parts[6])) 
+                        push!(wind_speeds, ws)
+                    catch e
+                        # Skip if line cannot be parsed (e.g., bad data)
+                    end
+                end
+            end
+            wind_speed_data[loc_id] = wind_speeds
+            println("  ✓ Loc $loc_id ($(details.name)): $(length(wind_speeds)) hours loaded.")
+        
+        catch e
+            # If any file operation fails, print the error and re-throw the exception
+            println("  ❌ FILE ERROR for Loc $loc_id, Year $year. Could not open or read: $filename")
+            println("  Error details: $e")
+            rethrow(e) # Stop execution for this year if a file is missing
+        end
+    end
+    
+    # Determine the number of hours (should be consistent, e.g., 8760 or 8784)
+    num_hours = isempty(wind_speed_data) ? 0 : length(first(values(wind_speed_data)))
+    return wind_speed_data, num_hours
+end
+
+# ============================================================================
+# OPTIMIZATION FUNCTION
+# ============================================================================
+"""Runs the optimization model for a single weather year."""
+function run_optimization_scenario(location_ids::Vector{Int}, year::Int, turbine_models::Dict, cf_curves::Dict)
+    
+    wind_speed_data, num_hours = load_wind_speed_data(location_ids, year)
+    
+    if num_hours == 0
+        println("❌ Optimization skipped for Year $year: No wind data loaded. This usually indicates a critical file error.")
+        # Returning a "Data Error" status here to distinguish from Gurobi's INFEASIBLE status
+        return Dict("Weather_Year" => year, "Total_Capacity_MW" => NaN, "Curtailed_Fraction" => NaN, "Optimization_Status" => "Data Error")
+    end
+
+    # Pre-compute capacity factors for all hours, locations, and turbines
+    cf_data = Dict()
+    for loc in location_ids, turbine in 1:3, h in 1:num_hours
+        cf_data[(loc, turbine, h)] = get_capacity_factor(wind_speed_data[loc][h], turbine, cf_curves)
+    end
+    
+    # Build model
+    model = Model(Gurobi.Optimizer)
+    set_optimizer_attribute(model, "OutputFlag", 0) # Suppress Gurobi output
+    set_optimizer_attribute(model, "TimeLimit", 600)
+    set_optimizer_attribute(model, "MIPGap", 0.01)
+
+    # Decision Variables
+    @variable(model, y[loc in location_ids, 1:3], Bin) # Binary: Is turbine type t chosen at location loc?
+    @variable(model, n[loc in location_ids, 1:3] >= 0, Int) # Integer: Number of turbines of type t at location loc
+
+    # C1: At most one turbine model per location
+    @constraint(model, [loc in location_ids], sum(y[loc, t] for t in 1:3) <= 1)
+    
+    # C2: Limit number of turbines to MAX_TURBINES only if that type is selected (linking constraints)
+    @constraint(model, [loc in location_ids, t in 1:3], n[loc, t] <= MAX_TURBINES * y[loc, t])
+    
+    # C3: Meet 100 MW of electricity demand for each hour of the year
+    @constraint(model, Power_Balance[h=1:num_hours], 
+        sum(n[loc, t] * turbine_models[t].rated_power * cf_data[(loc, t, h)] 
+            for loc in location_ids, t in 1:3) >= DEMAND_MW
+    )
+
+    # Objective: Minimize total installed capacity (MW)
+    @objective(model, Min, 
+        sum(n[loc, t] * turbine_models[t].rated_power for loc in location_ids, t in 1:3)
+    )
+
+    optimize!(model)
+
+    # Process Results
+    if termination_status(model) in [MOI.OPTIMAL, MOI.LOCALLY_SOLVED]
+        total_installed_capacity = objective_value(model)
+        
+        # Calculate curtailment
+        total_available_energy = 0.0
+        total_curtailed_energy = 0.0
+        
+        for h in 1:num_hours
+            # Total generation available in hour h
+            gen = sum(value(n[loc, t]) * turbine_models[t].rated_power * cf_data[(loc, t, h)] 
+                     for loc in location_ids, t in 1:3)
+            
+            total_available_energy += gen
+            # Curtailed energy is the surplus above the fixed demand
+            total_curtailed_energy += max(0, gen - DEMAND_MW)
+        end
+        
+        curtailed_fraction = total_curtailed_energy / total_available_energy
+        
+        return Dict(
+            "Weather_Year" => year,
+            "Total_Capacity_MW" => total_installed_capacity,
+            "Curtailed_Fraction" => curtailed_fraction,
+            "Optimization_Status" => string(termination_status(model))
+        )
+    else
+        # If optimization fails (e.g., INFEASIBLE, TIME_LIMIT), report the failure status
+        return Dict(
+            "Weather_Year" => year,
+            "Total_Capacity_MW" => NaN,
+            "Curtailed_Fraction" => NaN,
+            "Optimization_Status" => string(termination_status(model))
+        )
+    end
+end
+
+# ============================================================================
+# EXECUTION: SOLVE PART B
+# ============================================================================
+
+summary_results = []
+
+println("\n" * "="^80)
+println("SOLVING PART B: WEATHER YEAR SENSITIVITY (5 LOCATIONS ACROSS 3 YEARS)")
+println("="^80)
+
+for year in WEATHER_YEARS
+    print("\n\n" * "-"^80)
+    println("--- Starting optimization for Year $year ---")
+    print("-"^80)
+    
+    try
+        result = run_optimization_scenario(LOCATIONS_TO_SOLVE, year, TURBINE_MODELS, cf_curves)
+        
+        push!(summary_results, (
+            Weather_Year = result["Weather_Year"],
+            Total_Installed_Capacity_MW = round(result["Total_Capacity_MW"], digits=2),
+            Curtailed_Renewable_Energy_Fraction_Pct = round(result["Curtailed_Fraction"] * 100, digits=2),
+            Status = result["Optimization_Status"]
+        ))
+    catch e
+        # Catch exception from load_wind_speed_data (file missing)
+        println("Critical failure during data loading for Year $year.")
+        push!(summary_results, (
+            Weather_Year = year,
+            Total_Installed_Capacity_MW = NaN,
+            Curtailed_Renewable_Energy_Fraction_Pct = NaN,
+            Status = "Data Error (File Missing)"
+        ))
+    end
+end
+
+# Tabulate the Final Results
+println("\n\n" * "="^80)
+println("FINAL TABULATED RESULTS FOR PART B")
+println("5 Locations | Weather Years: 2010, 2011, 2012")
+println("="^80)
+
+summary_df = DataFrame(summary_results)
+println(summary_df)
