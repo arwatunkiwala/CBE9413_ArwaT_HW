@@ -1,0 +1,313 @@
+using JuMP
+using Gurobi
+using CSV
+using DataFrames
+using Plots
+using Statistics
+
+println("Loading data...")
+# Load data from correct file locations
+wind_cf = CSV.read("vre_cf.csv", DataFrame)
+prices = CSV.read("ercot_2022_HB_HUBAVG.csv", DataFrame)
+
+# Extract the relevant columns
+cf_data = wind_cf[:, :VRE_CF]
+price_data = prices[:, :total_lmp_da]
+
+# Ensure same length
+n_hours = min(length(cf_data), length(price_data))
+cf_data = cf_data[1:n_hours]
+price_data = price_data[1:n_hours]
+
+# Wind turbine parameters
+wind_capacity = 100  # MW
+wind_generation = wind_capacity .* cf_data  # MW for each hour
+
+# Fixed O&M cost for wind plant
+wind_om_cost = 30  # $/kW/year
+annual_wind_om = wind_om_cost * wind_capacity * 1000 / 1e6  # Million $/year
+
+# Battery parameters from Table 2
+battery_params = Dict(
+    "Li-ion" => Dict(
+        :power_cost => 257,  # $/kW
+        :energy_cost => 277,  # $/kWh
+        :charging_eff => 0.92,
+        :discharging_eff => 0.92,
+        :self_discharge => 2e-5,
+        :charging_cost => 1,  # $/MWh
+        :discharging_cost => 1,  # $/MWh
+        :min_soc => 0.05,
+        :max_soc => 0.95,
+        :min_e_to_p => 1,
+        :max_e_to_p => 10,
+        :min_power => 10,  # MW
+        :lifetime => 15
+    ),
+    "Metal-air" => Dict(
+        :power_cost => 1100,  # $/kW
+        :energy_cost => 10,  # $/kWh
+        :charging_eff => 0.72,
+        :discharging_eff => 0.59,
+        :self_discharge => 9e-5,
+        :charging_cost => 1,  # $/MWh
+        :discharging_cost => 1,  # $/MWh
+        :min_soc => 0.05,
+        :max_soc => 0.95,
+        :min_e_to_p => 10,
+        :max_e_to_p => 150,
+        :min_power => 10,  # MW
+        :lifetime => 15
+    )
+)
+
+# Annualization parameters
+discount_rate = 0.08
+n_years = 15
+
+function annualize_capital_cost(capital_cost, discount_rate, lifetime)
+    """Convert capital cost to annualized cost"""
+    crf = (discount_rate * (1 + discount_rate)^lifetime) / 
+          ((1 + discount_rate)^lifetime - 1)
+    return capital_cost * crf
+end
+
+function optimize_storage(battery_type, params, wind_gen, prices, n_hours)
+    """
+    Optimize storage capacity and operation for a given battery technology
+    """
+    println("\n", "="^60)
+    println("Optimizing $(battery_type) battery storage...")
+    println("="^60)
+    
+    # Create model with Gurobi
+    model = Model(Gurobi.Optimizer)
+    set_optimizer_attribute(model, "OutputFlag", 1)  # Show Gurobi output
+    set_optimizer_attribute(model, "TimeLimit", 300)  # 5 minute time limit
+    
+    # Decision variables - CAPACITY
+    @variable(model, P >= params[:min_power])  # Power capacity [MW]
+    @variable(model, E >= 0)  # Energy capacity [MWh]
+    
+    # Decision variables - OPERATION (indexed from 1 to n_hours for Julia)
+    @variable(model, C[1:n_hours] >= 0)  # Charging power [MW]
+    @variable(model, D[1:n_hours] >= 0)  # Discharging power [MW]
+    @variable(model, S[1:n_hours] >= 0)  # State of charge [MWh]
+    @variable(model, y[1:n_hours], Bin)  # Binary variable: 1 = discharge, 0 = charge
+    
+    # Parameters
+    eta_c = params[:charging_eff]
+    eta_d = params[:discharging_eff]
+    eta_loss = params[:self_discharge]
+    alpha_c = params[:charging_cost]
+    alpha_d = params[:discharging_cost]
+    delta_min = params[:min_soc]
+    delta_max = params[:max_soc]
+    
+    # Objective: Maximize profit
+    # Profit = Wind revenue + Battery arbitrage - Wind O&M - Battery capital costs
+    
+    # Wind revenue (sell all generated wind at market prices)
+    wind_revenue = @expression(model,
+        sum(prices[t] * wind_gen[t] for t in 1:n_hours)
+    )
+    
+    # Battery operational profit (arbitrage)
+    battery_profit = @expression(model,
+        sum((prices[t] - alpha_d) * D[t] - (prices[t] + alpha_c) * C[t] for t in 1:n_hours)
+    )
+    
+    # Annualized capital cost
+    power_capital = @expression(model, P * params[:power_cost] * 1000)  # Convert to $
+    energy_capital = @expression(model, E * params[:energy_cost] * 1000)  # Convert to $
+    
+    # Calculate CRF
+    crf = (discount_rate * (1 + discount_rate)^params[:lifetime]) / 
+          ((1 + discount_rate)^params[:lifetime] - 1)
+    
+    annual_capital = @expression(model, crf * (power_capital + energy_capital))
+    
+    # Wind O&M cost (in $)
+    annual_wind_om_cost = annual_wind_om * 1e6  # Convert from million $ to $
+    
+    # Total profit
+    @objective(model, Max, wind_revenue + battery_profit - annual_capital - annual_wind_om_cost)
+    
+    # Constraints
+    
+    # 1. Power capacity constraint: C_t + D_t <= P
+    @constraint(model, power_capacity[t=1:n_hours], 
+                C[t] + D[t] <= P)
+    
+    # 1b. Binary constraints to prevent simultaneous charging and discharging
+    @constraint(model, charge_binary[t=1:n_hours],
+                C[t] <= P * (1 - y[t]))  # Can only charge when y[t] = 0
+    @constraint(model, discharge_binary[t=1:n_hours],
+                D[t] <= P * y[t])  # Can only discharge when y[t] = 1
+    
+    # 2. Energy to power ratio constraints
+    @constraint(model, min_e_to_p, 
+                E >= params[:min_e_to_p] * P)
+    @constraint(model, max_e_to_p, 
+                E <= params[:max_e_to_p] * P)
+    
+    # 3. Storage inventory balance
+    # Initial time step (t=1): S[1] = (1 - eta_loss) * S_0 + eta_c * C[1] - D[1] / eta_d
+    # Assuming S_0 = 0
+    @constraint(model, storage_balance_initial,
+                S[1] == (1 - eta_loss) * 0 + eta_c * C[1] - D[1] / eta_d)
+    
+    # Subsequent time steps
+    @constraint(model, storage_balance[t=2:n_hours],
+                S[t] == (1 - eta_loss) * S[t-1] + eta_c * C[t] - D[t] / eta_d)
+    
+    # 4. SOC limits
+    @constraint(model, min_soc_constraint[t=1:n_hours],
+                S[t] >= delta_min * E)
+    @constraint(model, max_soc_constraint[t=1:n_hours],
+                S[t] <= delta_max * E)
+    
+    # 5. Final SOC constraint (end at reasonable level)
+    @constraint(model, final_soc,
+                S[n_hours] >= 0)
+    
+    # Solve
+    println("Solving optimization problem...")
+    optimize!(model)
+    
+    # Check solver status
+    if termination_status(model) != MOI.OPTIMAL
+        println("Warning: Solver did not find optimal solution.")
+        println("Status: ", termination_status(model))
+    else
+        println("Optimization successful!")
+    end
+    
+    # Extract results
+    P_opt = value(P)
+    E_opt = value(E)
+    profit_opt = objective_value(model)
+    
+    C_opt = [value(C[t]) for t in 1:n_hours]
+    D_opt = [value(D[t]) for t in 1:n_hours]
+    S_opt = [value(S[t]) for t in 1:n_hours]
+    
+    # Calculate metrics
+    duration = eta_d * E_opt / P_opt  # hours
+    annual_energy_supply = sum(D_opt)  # MWh
+    num_cycles = E_opt > 0 ? annual_energy_supply / E_opt : 0
+    
+    return Dict(
+        :model => model,
+        :P_opt => P_opt,
+        :E_opt => E_opt,
+        :profit_opt => profit_opt,
+        :C_opt => C_opt,
+        :D_opt => D_opt,
+        :S_opt => S_opt,
+        :duration => duration,
+        :num_cycles => num_cycles
+    )
+end
+
+# Optimize both battery types
+results_li_ion = optimize_storage("Li-ion", battery_params["Li-ion"], 
+                                  wind_generation, price_data, n_hours)
+results_metal_air = optimize_storage("Metal-air", battery_params["Metal-air"], 
+                                     wind_generation, price_data, n_hours)
+
+# Print results
+println("")
+println("="^80)
+println("OPTIMIZATION RESULTS")
+println("="^80)
+
+# Calculate values first
+li_P = round(results_li_ion[:P_opt], digits=2)
+li_E = round(results_li_ion[:E_opt], digits=2)
+li_dur = round(results_li_ion[:duration], digits=2)
+li_profit = round(results_li_ion[:profit_opt]/1e6, digits=2)
+li_cycles = round(results_li_ion[:num_cycles], digits=2)
+
+ma_P = round(results_metal_air[:P_opt], digits=2)
+ma_E = round(results_metal_air[:E_opt], digits=2)
+ma_dur = round(results_metal_air[:duration], digits=2)
+ma_profit = round(results_metal_air[:profit_opt]/1e6, digits=2)
+ma_cycles = round(results_metal_air[:num_cycles], digits=2)
+
+# Print Li-ion
+println("")
+println("Li-ion Battery:")
+println("  Optimal Power Capacity: ", li_P, " MW")
+println("  Optimal Energy Capacity: ", li_E, " MWh")
+println("  Storage Duration: ", li_dur, " hours")
+println("  Optimal Profit: Dollar ", li_profit, " Million")
+println("  Number of Cycles: ", li_cycles)
+
+# Print Metal-air
+println("")
+println("Metal-air Battery:")
+println("  Optimal Power Capacity: ", ma_P, " MW")
+println("  Optimal Energy Capacity: ", ma_E, " MWh")
+println("  Storage Duration: ", ma_dur, " hours")
+println("  Optimal Profit: Dollar ", ma_profit, " Million")
+println("  Number of Cycles: ", ma_cycles)
+
+# Plot normalized state of charge for hours 4000-6000
+println("\nGenerating plots...")
+
+# Define the time window
+start_hour = 4000
+end_hour = 6000
+
+# Create plots
+p1 = plot(layout=(2,1), size=(1000, 800))
+
+for (idx, (name, results)) in enumerate([("Li-ion Battery", results_li_ion), 
+                                          ("Metal-air Battery", results_metal_air)])
+    S_normalized = results[:S_opt] ./ results[:E_opt]  # Normalize by energy capacity
+    
+    plot!(p1[idx], start_hour:end_hour-1, S_normalized[start_hour:end_hour-1],
+          label=name, linewidth=2, xlabel="Hour", 
+          ylabel="Normalized State of Charge",
+          title="$(name) - State of Charge (Hours $(start_hour)-$(end_hour))",
+          grid=true, ylims=(0, 1), legend=:topright)
+end
+
+savefig(p1, "storage_soc_comparison.png")
+println("Plot saved as 'storage_soc_comparison.png'")
+
+# Additional analysis plot: Charging/Discharging behavior
+p2 = plot(layout=(2,2), size=(1200, 800))
+
+for (idx, (name, results)) in enumerate([("Li-ion Battery", results_li_ion), 
+                                          ("Metal-air Battery", results_metal_air)])
+    # Plot 1: Charging and discharging
+    plot!(p2[idx,1], start_hour:end_hour-1, 
+          [results[:C_opt][start_hour:end_hour-1] results[:D_opt][start_hour:end_hour-1]],
+          label=["Charging" "Discharging"], alpha=0.7,
+          xlabel="Hour", ylabel="Power (MW)",
+          title="$(name) - Charging/Discharging",
+          grid=true)
+    
+    # Plot 2: SOC vs Price
+    plot!(p2[idx,2], start_hour:end_hour-1, 
+          results[:S_opt][start_hour:end_hour-1] ./ results[:E_opt],
+          label="SOC", linewidth=2, color=:blue,
+          xlabel="Hour", ylabel="Normalized SOC",
+          title="$(name) - SOC vs Price",
+          grid=true, legend=:topleft)
+    
+    # Add price on secondary axis (approximate with scaling)
+    price_normalized = (price_data[start_hour:end_hour-1] .- minimum(price_data[start_hour:end_hour-1])) ./ 
+                       (maximum(price_data[start_hour:end_hour-1]) - minimum(price_data[start_hour:end_hour-1]))
+    plot!(p2[idx,2], start_hour:end_hour-1, price_normalized,
+          label="Price (normalized)", linestyle=:dash, color=:red, alpha=0.5)
+end
+
+savefig(p2, "storage_detailed_analysis.png")
+println("Detailed analysis plot saved as 'storage_detailed_analysis.png'")
+
+println("\n", "="^80)
+println("Analysis complete!")
+println("="^80)
