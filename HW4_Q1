@@ -1,0 +1,246 @@
+# Install packages (run once)
+using Pkg
+Pkg.add("JuMP")
+Pkg.add("Gurobi")
+Pkg.add("CSV")
+Pkg.add("DataFrames")
+Pkg.add("Plots")
+
+using JuMP, Gurobi, CSV, DataFrames, Plots
+
+# Load price data
+df = CSV.read("CAISO_prices_Sept2022.csv", DataFrame)
+prices = Float64.(df.total_lmp_da)
+times = df.Time
+
+# System parameters
+P_cap = 10.0          # Power capacity (MW)
+E_cap = 40.0          # Energy capacity (MWh)
+eta_charge = 0.92     # Charging efficiency
+eta_discharge = 0.92  # Discharging efficiency
+cost_charge = 1.0     # Charging cost ($/MWh)
+cost_discharge = 1.0  # Discharging cost ($/MWh)
+soc_max = 0.95 * E_cap
+soc_min = 0.0 * E_cap
+soc_end_min = 0.0 * E_cap
+self_discharge = 0.0
+dt = 1.0
+alpha_cc_cv = 36.0  # Constant current to constant voltage transition (MWh)
+
+# Horizons
+total_hours = length(prices)
+lookahead_hours = 4 * 24
+
+# ============================================================================
+# SCENARIO A: No Foresight (1 day optimization)
+# ============================================================================
+
+function optimize_no_foresight(prices::Vector{Float64}, P_cap, E_cap, eta_charge, 
+                                eta_discharge, cost_charge, cost_discharge, 
+                                soc_min, soc_max, soc_end_min, self_discharge, dt, alpha_cc_cv)
+    
+    total_hours = length(prices)
+    C_result = zeros(total_hours)
+    D_result = zeros(total_hours)
+    S_result = zeros(total_hours)
+    profit_daily = zeros(div(total_hours, 24))
+    
+    current_soc = 0.5 * E_cap
+    
+    for day in 0:(div(total_hours, 24) - 1)
+        start_idx = day * 24 + 1
+        end_idx = min((day + 1) * 24, total_hours)
+        n_hours = end_idx - start_idx + 1
+        day_prices = prices[start_idx:end_idx]
+        
+        model = Model(Gurobi.Optimizer)
+        set_silent(model)
+        
+        @variable(model, C[1:n_hours] >= 0)
+        @variable(model, D[1:n_hours] >= 0)
+        @variable(model, S[0:n_hours] >= 0)
+        @variable(model, y[1:n_hours], Bin)
+        
+        # Minimize cost = negative profit
+        @objective(model, Min, sum(
+            (day_prices[t] + cost_charge) * C[t] - (day_prices[t] - cost_discharge) * D[t]
+            for t in 1:n_hours))
+        
+        # Initial state
+        @constraint(model, S[0] == current_soc)
+        
+        # Storage balance
+        for t in 1:n_hours
+            @constraint(model, S[t] == (1 - self_discharge) * S[t-1] + 
+                                eta_charge * C[t] * dt - (D[t] * dt) / eta_discharge)
+        end
+        
+        # Power constraints with SOC-dependent charging
+        @constraint(model, [t in 1:n_hours], C[t] <= P_cap)
+        @constraint(model, [t in 1:n_hours], C[t] <= P_cap * (E_cap - S[t-1]) / (E_cap - alpha_cc_cv))
+        @constraint(model, [t in 1:n_hours], D[t] <= P_cap)
+        @constraint(model, [t in 1:n_hours], C[t] + D[t] <= P_cap)
+        @constraint(model, [t in 1:n_hours], C[t] <= P_cap * (1 - y[t]))
+        @constraint(model, [t in 1:n_hours], D[t] <= P_cap * y[t])
+        
+        # Storage bounds
+        @constraint(model, [t in 1:n_hours], S[t] >= soc_min)
+        @constraint(model, [t in 1:n_hours], S[t] <= soc_max)
+        @constraint(model, S[n_hours] >= soc_end_min)
+        
+        optimize!(model)
+        
+        # Store results
+        for t in 1:n_hours
+            idx = start_idx + t - 1
+            C_result[idx] = value(C[t])
+            D_result[idx] = value(D[t])
+            S_result[idx] = value(S[t])
+        end
+        
+        profit_daily[day + 1] = -objective_value(model)
+        current_soc = value(S[n_hours])
+    end
+    
+    return C_result, D_result, S_result, sum(profit_daily)
+end
+
+# ============================================================================
+# SCENARIO B: Rolling Horizon (4-day lookahead, 1-day implementation)
+# ============================================================================
+
+function optimize_rolling_horizon(prices::Vector{Float64}, P_cap, E_cap, eta_charge, 
+                                   eta_discharge, cost_charge, cost_discharge, 
+                                   soc_min, soc_max, soc_end_min, self_discharge, dt, 
+                                   lookahead_hours, alpha_cc_cv)
+    
+    total_hours = length(prices)
+    C_result = zeros(total_hours)
+    D_result = zeros(total_hours)
+    S_result = zeros(total_hours)
+    
+    current_soc = 0.5 * E_cap
+    
+    for day in 0:(div(total_hours, 24) - 1)
+        start_idx = day * 24 + 1
+        end_idx = min(start_idx + lookahead_hours - 1, total_hours)
+        actual_lookahead = end_idx - start_idx + 1
+        
+        window_prices = prices[start_idx:end_idx]
+        
+        # Pad if we're at the end
+        if actual_lookahead < lookahead_hours
+            window_prices = vcat(window_prices, fill(window_prices[end], lookahead_hours - actual_lookahead))
+        end
+        
+        model = Model(Gurobi.Optimizer)
+        set_silent(model)
+        
+        @variable(model, C[1:lookahead_hours] >= 0)
+        @variable(model, D[1:lookahead_hours] >= 0)
+        @variable(model, S[0:lookahead_hours] >= 0)
+        @variable(model, y[1:lookahead_hours], Bin)
+        
+        @objective(model, Min, sum(
+            (window_prices[t] + cost_charge) * C[t] - (window_prices[t] - cost_discharge) * D[t]
+            for t in 1:lookahead_hours))
+        
+        @constraint(model, S[0] == current_soc)
+        
+        for t in 1:lookahead_hours
+            @constraint(model, S[t] == (1 - self_discharge) * S[t-1] + 
+                                eta_charge * C[t] * dt - (D[t] * dt) / eta_discharge)
+        end
+        
+        @constraint(model, [t in 1:lookahead_hours], C[t] <= P_cap)
+        @constraint(model, [t in 1:lookahead_hours], C[t] <= P_cap * (E_cap - S[t-1]) / (E_cap - alpha_cc_cv))
+        @constraint(model, [t in 1:lookahead_hours], D[t] <= P_cap)
+        @constraint(model, [t in 1:lookahead_hours], C[t] + D[t] <= P_cap)
+        @constraint(model, [t in 1:lookahead_hours], C[t] <= P_cap * (1 - y[t]))
+        @constraint(model, [t in 1:lookahead_hours], D[t] <= P_cap * y[t])
+        @constraint(model, [t in 1:lookahead_hours], S[t] >= soc_min)
+        @constraint(model, [t in 1:lookahead_hours], S[t] <= soc_max)
+        @constraint(model, S[lookahead_hours] >= soc_end_min)
+        
+        optimize!(model)
+        
+        # Implement only first day (24 hours)
+        n_implement = min(24, actual_lookahead)
+        for t in 1:n_implement
+            idx = start_idx + t - 1
+            C_result[idx] = value(C[t])
+            D_result[idx] = value(D[t])
+            S_result[idx] = value(S[t])
+        end
+        
+        current_soc = value(S[24])
+    end
+    
+    total_profit = sum((prices .- cost_discharge) .* D_result - (prices .+ cost_charge) .* C_result)
+    
+    return C_result, D_result, S_result, total_profit
+end
+
+# ============================================================================
+# RUN BOTH SCENARIOS
+# ============================================================================
+
+println("Running Scenario A: No Foresight (1-day optimization)...")
+C_a, D_a, S_a, profit_a = optimize_no_foresight(prices, P_cap, E_cap, eta_charge, 
+                                                  eta_discharge, cost_charge, cost_discharge, 
+                                                  soc_min, soc_max, soc_end_min, self_discharge, dt)
+
+println("Running Scenario B: Rolling Horizon (4-day lookahead)...")
+C_b, D_b, S_b, profit_b = optimize_rolling_horizon(prices, P_cap, E_cap, eta_charge, 
+                                                     eta_discharge, cost_charge, cost_discharge, 
+                                                     soc_min, soc_max, soc_end_min, self_discharge, dt, 
+                                                     lookahead_hours)
+
+# ============================================================================
+# RESULTS
+# ============================================================================
+
+println("\n" * "="^70)
+println("ENERGY STORAGE OPTIMIZATION RESULTS")
+println("="^70)
+println("\nSCENARIO A - No Foresight (1-day at a time):")
+println("  Total Profit:              \$$(round(profit_a; digits=2))")
+println("  Total Energy Charged:      $(round(sum(C_a); digits=2)) MWh")
+println("  Total Energy Discharged:   $(round(sum(D_a); digits=2)) MWh")
+println("  Final SOC:                 $(round(S_a[end]; digits=2)) MWh")
+
+println("\nSCENARIO B - Rolling Horizon (4-day lookahead):")
+println("  Total Profit:              \$$(round(profit_b; digits=2))")
+println("  Total Energy Charged:      $(round(sum(C_b); digits=2)) MWh")
+println("  Total Energy Discharged:   $(round(sum(D_b); digits=2)) MWh")
+println("  Final SOC:                 $(round(S_b[end]; digits=2)) MWh")
+
+improvement = profit_b - profit_a
+pct_improvement = (improvement / abs(profit_a)) * 100
+println("\n" * "-"^70)
+println("COMPARISON:")
+println("  Profit Improvement:        \$$(round(improvement; digits=2))")
+println("  Percentage Improvement:    $(round(pct_improvement; digits=2))%")
+println("="^70)
+
+# Save results
+results_a = DataFrame(
+    hour = 1:total_hours,
+    price = prices,
+    charge_a = C_a,
+    discharge_a = D_a,
+    soc_a = S_a
+)
+
+results_b = DataFrame(
+    hour = 1:total_hours,
+    price = prices,
+    charge_b = C_b,
+    discharge_b = D_b,
+    soc_b = S_b
+)
+
+CSV.write("results_scenario_a.csv", results_a)
+CSV.write("results_scenario_b.csv", results_b)
+
+println("\nResults saved to CSV files.")
