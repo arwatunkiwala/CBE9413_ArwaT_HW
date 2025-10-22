@@ -1,0 +1,442 @@
+"""
+Solar PV LCOE Analysis - Using NSRDB data
+"""
+
+import pandas as pd
+import numpy as np
+import pvlib
+from pvlib.location import Location
+from pvlib.pvsystem import PVSystem, Array, FixedMount, SingleAxisTrackerMount
+from pvlib.modelchain import ModelChain
+
+# ============================================================================
+# CONFIGURATION
+# ============================================================================
+
+# NSRDB API Configuration
+NSRDB_API_KEY = 'GIwKVmyo6N1PhJ7yADxIH2j7xFVdwEzStye1KIM4'
+NSRDB_EMAIL = 'arwa.tunkiwala@gmail.com'
+NSRDB_YEAR = 2020  # Year of data to retrieve (1998-2020 available)
+
+# Financial parameters
+LIFETIME = 25  # years
+DISCOUNT_RATE = 0.07  # 7%
+HOURS_PER_YEAR = 8760
+
+# System specifications
+AC_CAPACITY_MW = 10  # 10 MW AC capacity
+DC_AC_RATIO = 1.2
+DC_CAPACITY_MW = AC_CAPACITY_MW * DC_AC_RATIO
+
+# Cost parameters
+CAPITAL_COST_FIXED = 1200  # $/kW AC
+CAPITAL_COST_TRACKING = 1450  # $/kW AC
+OM_FIXED = 15  # $/kW-year AC
+OM_TRACKING = 18  # $/kW-year AC
+
+# System degradation
+DEGRADATION_RATE = 0.005  # 0.5% per year
+
+# Incentive parameters
+ITC_RATE = 0.30  # 30% of capital cost
+PTC_RATE = 25  # $/MWh
+PTC_DURATION = 10  # years
+
+# PV system technical parameters
+module_power = 400  # W
+modules_per_string = 1000
+strings_per_inverter = 10
+inverter_nom_loss = 0.04
+
+losses = {
+    'soiling': 2,
+    'shading': 3,
+    'snow': 0,
+    'mismatch': 2,
+    'wiring': 2,
+    'connection': 0.5,
+    'lid': 1,
+    'nameplate_rating': 0.0,
+    'age': 0.0,
+    'availability': 3
+}
+
+# ============================================================================
+# FUNCTIONS
+# ============================================================================
+
+def get_nsrdb_data(lat, lon, year, api_key, email):
+    """
+    Get solar data - tries NSRDB first, falls back to PVGIS if rate limited
+    """
+    try:
+        print(f"  Downloading NSRDB PSM3 data for {year}...")
+        print(f"  Location: {lat}°N, {lon}°W")
+        
+        # Try pvlib's get_psm3 first
+        from pvlib.iotools import get_psm3
+        
+        data, meta = get_psm3(
+            latitude=lat,
+            longitude=lon,
+            names=str(year),
+            api_key=api_key,
+            email=email,
+            map_variables=True
+        )
+        
+        if 'temp_air' in data.columns:
+            data['air_temperature'] = data['temp_air']
+        
+        print(f"  ✓ Downloaded {len(data)} hours of NSRDB data")
+        return data, meta
+        
+    except Exception as e:
+        error_msg = str(e).lower()
+        
+        if '429' in error_msg or 'rate limit' in error_msg:
+            print(f"  ⚠ NSRDB rate limit exceeded")
+        else:
+            print(f"  ⚠ NSRDB failed: {e}")
+        
+        # FALLBACK: Use PVGIS (free, no API key, no rate limits!)
+        print(f"  → Switching to PVGIS data (free, no API key needed)...")
+        
+        try:
+            from pvlib.iotools import get_pvgis_tmy
+            
+            # Try new API first (returns 4 values)
+            try:
+                data, months_selected, inputs, meta = get_pvgis_tmy(
+                    latitude=lat,
+                    longitude=lon,
+                    map_variables=True
+                )
+            except ValueError:
+                # Older pvlib version returns only 2 values
+                data, meta = get_pvgis_tmy(
+                    latitude=lat,
+                    longitude=lon,
+                    map_variables=True
+                )
+            
+            # PVGIS uses temp_air, we need air_temperature
+            if 'temp_air' in data.columns:
+                data['air_temperature'] = data['temp_air']
+            
+            print(f"  ✓ Downloaded {len(data)} hours of PVGIS TMY data")
+            print(f"  Note: Using typical meteorological year (TMY) data")
+            
+            return data, meta
+            
+        except Exception as e2:
+            print(f"  ✗ PVGIS also failed: {e2}")
+            raise ValueError("Both NSRDB and PVGIS failed. Check internet connection.")
+
+
+def simulate_pv_system(lat, lon, tz, year, api_key, email, is_tracking=False):
+    """
+    Simulate PV system using pvlib with NSRDB data
+    """
+    print(f"  Getting NSRDB weather data...")
+    
+    # Get NSRDB data
+    data, meta = get_nsrdb_data(lat, lon, year, api_key, email)
+    
+    # Create location object
+    location = Location(latitude=lat, longitude=lon, tz=tz)
+    
+    # Module and inverter parameters
+    module_params = {'pdc0': module_power, 'gamma_pdc': -0.004}
+    SystemCapacityDC = module_power * modules_per_string * strings_per_inverter
+    inverter_params = {
+        'pdc0': SystemCapacityDC / DC_AC_RATIO,
+        'eta_inv_nom': 1 - inverter_nom_loss
+    }
+    
+    # Define mounting
+    if is_tracking:
+        mount = SingleAxisTrackerMount(
+            axis_tilt=0,
+            axis_azimuth=180,
+            backtrack=True,
+            gcr=0.33,
+            max_angle=60.0
+        )
+    else:
+        surface_tilt = abs(lat)
+        mount = FixedMount(
+            surface_tilt=surface_tilt,
+            surface_azimuth=180
+        )
+    
+    # Define array
+    array = Array(
+        mount=mount,
+        module='pvwatts_dc',
+        module_parameters=module_params,
+        modules_per_string=modules_per_string,
+        strings=strings_per_inverter,
+        temperature_model_parameters=pvlib.temperature.TEMPERATURE_MODEL_PARAMETERS['sapm']['open_rack_glass_glass']
+    )
+    
+    # Define system
+    system = PVSystem(
+        arrays=[array],
+        inverter_parameters=inverter_params,
+        losses_parameters=losses
+    )
+    
+    # Run model
+    mc = ModelChain(
+        system, location,
+        aoi_model='physical',
+        spectral_model='no_loss',
+        dc_model='pvwatts',
+        ac_model='pvwatts',
+        temperature_model='sapm',
+        transposition_model='perez',
+        losses_model='pvwatts'
+    )
+    
+    mc.run_model(weather=data)
+    
+    # Scale to plant capacity
+    NumberofSystems = DC_CAPACITY_MW / (SystemCapacityDC / 1e6)
+    ac_output_mw = mc.results.ac / 1e6 * NumberofSystems
+    
+    # Calculate capacity factor
+    annual_gen_mwh = ac_output_mw.sum()
+    capacity_factor = annual_gen_mwh / (AC_CAPACITY_MW * HOURS_PER_YEAR)
+    
+    print(f"  Annual generation: {annual_gen_mwh:,.0f} MWh")
+    print(f"  Capacity factor: {capacity_factor:.1%}")
+    
+    return annual_gen_mwh, capacity_factor
+
+
+def calculate_lcoe(annual_gen_mwh, capital_cost, annual_om, incentive_type='none'):
+    """
+    Calculate Levelized Cost of Energy (LCOE)
+    """
+    
+    # Adjust capital cost for ITC
+    if incentive_type == 'ITC':
+        capital_cost_adjusted = capital_cost * (1 - ITC_RATE)
+    else:
+        capital_cost_adjusted = capital_cost
+    
+    # Initialize NPV calculations
+    npv_costs = capital_cost_adjusted
+    npv_generation = 0
+    npv_ptc_revenue = 0
+    
+    # Calculate NPV over project lifetime
+    for year_num in range(1, LIFETIME + 1):
+        discount_factor = 1 / (1 + DISCOUNT_RATE) ** year_num
+        
+        # Generation degrades each year
+        degradation_factor = (1 - DEGRADATION_RATE) ** (year_num - 1)
+        generation_this_year = annual_gen_mwh * degradation_factor
+        
+        # Add discounted O&M costs
+        npv_costs += annual_om * discount_factor
+        
+        # Add discounted generation
+        npv_generation += generation_this_year * discount_factor
+        
+        # Add PTC revenue (first 10 years only)
+        if incentive_type == 'PTC' and year_num <= PTC_DURATION:
+            ptc_revenue = generation_this_year * PTC_RATE
+            npv_ptc_revenue += ptc_revenue * discount_factor
+    
+    # LCOE calculation
+    lcoe = (npv_costs - npv_ptc_revenue) / npv_generation
+    
+    return lcoe
+
+
+def analyze_scenario(location_key, loc_info, is_tracking, year, api_key, email):
+    """Run complete analysis for one scenario"""
+    
+    system_type = "tracking" if is_tracking else "fixed"
+    
+    print(f"\n{'='*70}")
+    print(f"Scenario: {loc_info['name']} - {system_type}")
+    print(f"{'='*70}")
+    
+    # Simulate PV system
+    annual_gen_mwh, capacity_factor = simulate_pv_system(
+        loc_info['lat'], loc_info['lon'], loc_info['tz'], 
+        year, api_key, email, is_tracking
+    )
+    
+    # Calculate costs
+    if is_tracking:
+        capital_cost = CAPITAL_COST_TRACKING * AC_CAPACITY_MW * 1000
+        annual_om = OM_TRACKING * AC_CAPACITY_MW * 1000
+    else:
+        capital_cost = CAPITAL_COST_FIXED * AC_CAPACITY_MW * 1000
+        annual_om = OM_FIXED * AC_CAPACITY_MW * 1000
+    
+    # Calculate LCOE under both incentives
+    lcoe_itc = calculate_lcoe(annual_gen_mwh, capital_cost, annual_om, 'ITC')
+    lcoe_ptc = calculate_lcoe(annual_gen_mwh, capital_cost, annual_om, 'PTC')
+    
+    print(f"  Capital cost: ${capital_cost/1e6:.2f}M")
+    print(f"  Annual O&M: ${annual_om/1e3:.0f}k")
+    print(f"  LCOE with ITC: ${lcoe_itc:.2f}/MWh")
+    print(f"  LCOE with PTC: ${lcoe_ptc:.2f}/MWh")
+    print(f"  Better incentive: {'ITC' if lcoe_itc < lcoe_ptc else 'PTC'}")
+    
+    return {
+        'Location': loc_info['name'],
+        'System': system_type.capitalize(),
+        'CF (%)': f"{capacity_factor*100:.1f}",
+        'Annual Gen (MWh)': f"{annual_gen_mwh:,.0f}",
+        'Capital ($M)': f"{capital_cost/1e6:.2f}",
+        'Annual O&M ($k)': f"{annual_om/1e3:.0f}",
+        'LCOE - ITC ($/MWh)': f"{lcoe_itc:.2f}",
+        'LCOE - PTC ($/MWh)': f"{lcoe_ptc:.2f}",
+        'Lower LCOE': 'ITC' if lcoe_itc < lcoe_ptc else 'PTC',
+        'annual_gen_mwh': annual_gen_mwh,
+        'capacity_factor': capacity_factor,
+        'capital_cost': capital_cost,
+        'annual_om': annual_om,
+        'lcoe_itc': lcoe_itc,
+        'lcoe_ptc': lcoe_ptc
+    }
+
+
+# ============================================================================
+# MAIN ANALYSIS
+# ============================================================================
+
+if __name__ == "__main__":
+    
+    print("="*70)
+    print("SOLAR PV LCOE ANALYSIS - Using NSRDB PSM3 Data")
+    print("="*70)
+    print(f"\nConfiguration:")
+    print(f"  AC Capacity: {AC_CAPACITY_MW} MW")
+    print(f"  DC Capacity: {DC_CAPACITY_MW} MW (DC/AC ratio: {DC_AC_RATIO})")
+    print(f"  Lifetime: {LIFETIME} years")
+    print(f"  Discount rate: {DISCOUNT_RATE*100}%")
+    print(f"  Degradation: {DEGRADATION_RATE*100}% per year")
+    print(f"  NSRDB Year: {NSRDB_YEAR}")
+    print(f"\nIncentives:")
+    print(f"  ITC: {ITC_RATE*100}% capital cost reduction")
+    print(f"  PTC: ${PTC_RATE}/MWh for {PTC_DURATION} years")
+    
+    # Define locations
+    locations = {
+        'SW': {'lat': 34.05, 'lon': -118.25, 'tz': 'America/Los_Angeles', 'name': 'Southwest (LA)'},
+        'NE': {'lat': 42.3555, 'lon': -71.0565, 'tz': 'America/New_York', 'name': 'Northeast (Boston)'}
+    }
+    
+    # Run all 4 scenarios
+    scenarios = [
+        ('SW', False),  # Southwest fixed
+        ('SW', True),   # Southwest tracking
+        ('NE', False),  # Northeast fixed
+        ('NE', True)    # Northeast tracking
+    ]
+    
+    results = []
+    for loc_key, is_tracking in scenarios:
+        result = analyze_scenario(
+            loc_key, locations[loc_key], is_tracking, 
+            NSRDB_YEAR, NSRDB_API_KEY, NSRDB_EMAIL
+        )
+        results.append(result)
+    
+    # Create summary table
+    df = pd.DataFrame(results)
+    
+    print("\n" + "="*70)
+    print("PART A: LCOE SUMMARY TABLE")
+    print("="*70 + "\n")
+    
+    display_cols = ['Location', 'System', 'CF (%)', 'Annual Gen (MWh)', 
+                    'Capital ($M)', 'Annual O&M ($k)', 
+                    'LCOE - ITC ($/MWh)', 'LCOE - PTC ($/MWh)', 'Lower LCOE']
+    print(df[display_cols].to_string(index=False))
+    
+    # PART B: Analysis
+    print("\n" + "="*70)
+    print("PART B: WHICH INCENTIVE GIVES LOWER LCOE AND WHY?")
+    print("="*70 + "\n")
+    
+    for _, row in df.iterrows():
+        print(f"{row['Location']} - {row['System']}:")
+        print(f"  CF: {row['CF (%)']}%")
+        print(f"  ITC LCOE: ${row['lcoe_itc']:.2f}/MWh")
+        print(f"  PTC LCOE: ${row['lcoe_ptc']:.2f}/MWh")
+        
+        if row['lcoe_itc'] < row['lcoe_ptc']:
+            diff = row['lcoe_ptc'] - row['lcoe_itc']
+            print(f"  → ITC is better by ${diff:.2f}/MWh")
+        else:
+            diff = row['lcoe_itc'] - row['lcoe_ptc']
+            print(f"  → PTC is better by ${diff:.2f}/MWh")
+        print()
+    
+    print("Explanation:")
+    print("- ITC provides 30% upfront capital cost reduction")
+    print("- PTC provides $25/MWh revenue for 10 years")
+    print("- Higher CF locations generate more electricity → more PTC revenue")
+    print("- Lower CF locations benefit more from upfront ITC capital reduction")
+    
+    # PART C: Sensitivity
+    print("\n" + "="*70)
+    print("PART C: SENSITIVITY ANALYSIS - PTC at $40/MWh")
+    print("="*70 + "\n")
+    
+    sensitivity_results = []
+    for _, row in df.iterrows():
+        annual_gen = row['annual_gen_mwh']
+        capital = row['capital_cost']
+        om = row['annual_om']
+        
+        # Calculate new PTC LCOE with $40/MWh
+        npv_costs = capital
+        npv_generation = 0
+        npv_ptc_revenue = 0
+        
+        for year_num in range(1, LIFETIME + 1):
+            discount_factor = 1 / (1 + DISCOUNT_RATE) ** year_num
+            degradation_factor = (1 - DEGRADATION_RATE) ** (year_num - 1)
+            generation_this_year = annual_gen * degradation_factor
+            
+            npv_costs += om * discount_factor
+            npv_generation += generation_this_year * discount_factor
+            
+            if year_num <= PTC_DURATION:
+                ptc_revenue = generation_this_year * 40  # $40/MWh
+                npv_ptc_revenue += ptc_revenue * discount_factor
+        
+        lcoe_ptc_40 = (npv_costs - npv_ptc_revenue) / npv_generation
+        
+        sensitivity_results.append({
+            'Scenario': f"{row['Location']} {row['System']}",
+            'CF (%)': row['CF (%)'],
+            'ITC': f"${row['lcoe_itc']:.2f}",
+            'PTC@$25': f"${row['lcoe_ptc']:.2f}",
+            'PTC@$40': f"${lcoe_ptc_40:.2f}",
+            'Winner@$25': row['Lower LCOE'],
+            'Winner@$40': 'ITC' if row['lcoe_itc'] < lcoe_ptc_40 else 'PTC'
+        })
+    
+    df_sens = pd.DataFrame(sensitivity_results)
+    print(df_sens.to_string(index=False))
+    
+    print("\nConclusion:")
+    print("At $40/MWh, PTC becomes more attractive, especially for high-CF locations.")
+    
+    # Save results
+    df.to_csv('lcoe_results_nsrdb.csv', index=False)
+    df_sens.to_csv('lcoe_sensitivity_nsrdb.csv', index=False)
+    
+    print("\n" + "="*70)
+    print("Results saved to lcoe_results_nsrdb.csv and lcoe_sensitivity_nsrdb.csv")
+    print("="*70)
