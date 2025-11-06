@@ -1,0 +1,378 @@
+using JuMP, Gurobi, CSV, DataFrames, Plots, Printf, Downloads
+
+println("="^80)
+println("QUESTION 2 PART B: OPTIMAL DISPATCH WITH NN FUEL COST")
+println("="^80)
+
+# ============================================================================
+# 1. LOAD TIME SERIES DATA
+# ============================================================================
+println("\n1. Loading time series data...")
+println("-"^80)
+
+data_url = "https://raw.githubusercontent.com/dharik13/CBE9413-Energy-Systems/main/Approximations/HW6/demand_vre_time_series.csv"
+data_file = "demand_vre_time_series.csv"
+
+if !isfile(data_file)
+    println("   Downloading data from GitHub...")
+    Downloads.download(data_url, data_file)
+end
+
+data = CSV.read(data_file, DataFrame)
+println("   ✓ Data loaded: $(nrow(data)) hours")
+println("   Columns: $(names(data))")
+
+T = nrow(data)
+demand = data.Demand_MW
+cf_solar = data.Solar_CF
+cf_wind = data.Wind_CF
+
+# ============================================================================
+# 2. SYSTEM PARAMETERS
+# ============================================================================
+println("\n2. System parameters...")
+println("-"^80)
+
+P_solar_cap = 400.0
+P_wind_cap = 400.0
+P_fossil_cap = 800.0
+P_fossil_min = 160.0
+
+fuel_cost = 4.0
+loadshed_cost = 1000.0
+
+println("   Fossil plant capacity: $P_fossil_cap MW")
+println("   Fossil plant minimum: $P_fossil_min MW")
+println("   Solar capacity: $P_solar_cap MW")
+println("   Wind capacity: $P_wind_cap MW")
+println("   Fuel cost: $fuel_cost \$/MMBtu")
+println("   Load shedding cost: $loadshed_cost \$/MWh")
+
+# ============================================================================
+# 3. NEURAL NETWORK PARAMETERS (YOUR TRAINED VALUES)
+# ============================================================================
+println("\n3. Loading trained neural network parameters...")
+println("-"^80)
+
+# NORMALIZATION PARAMETERS - FROM YOUR TRAINING OUTPUT
+P_mean = 437.94549f0
+P_std = 184.44678f0
+alpha_mean = 3333.225635f0
+alpha_std = 1389.57797f0
+
+println("   ✓ Using normalization parameters from training")
+println("   P: mean=$P_mean, std=$P_std")
+println("   alpha: mean=$alpha_mean, std=$alpha_std")
+println("   ✓ Alpha mean is positive - fuel consumption properly normalized")
+
+# SM1 PARAMETERS (6 neurons)
+W1_SM1 = Float32[
+    0.225776;
+    0.004924;
+    -1.125839;
+    -1.520160;
+    0.283543;
+    0.215519
+]
+
+b1_SM1 = Float32[
+    -0.335286;
+    -0.029548;
+    -0.964131;
+    -1.230662;
+    0.475433;
+    -0.319959
+]
+
+W2_SM1 = Float32[0.893831 0.121560 1.297979 1.019660 -1.228228 0.827182]
+
+b2_SM1 = Float32[0.243754]
+
+# SM2 PARAMETERS (10 neurons)
+W1_SM2 = Float32[
+    -1.515237;
+    -0.245737;
+    -0.252810;
+    -0.401305;
+    -1.594690;
+    -0.028168;
+    -0.907845;
+    2.975040;
+    3.807413;
+    4.700529
+]
+
+b1_SM2 = Float32[
+    -0.656727;
+    0.433086;
+    0.445411;
+    0.704341;
+    -0.692495;
+    -0.066940;
+    -0.559705;
+    1.102303;
+    1.406759;
+    2.041193
+]
+
+W2_SM2 = Float32[1.277246 -0.933204 -0.907832 -0.813500 0.867000 -0.083300 0.841776 -3.292678 -3.138828 4.327710]
+
+b2_SM2 = Float32[0.531182]
+
+println("   ✓ SM1 loaded (6 neurons, MSE=261.61)")
+println("   ✓ SM2 loaded (10 neurons, MSE=86.13)")
+
+# ============================================================================
+# 4. HELPER FUNCTION: COMPUTE ReLU BOUNDS
+# ============================================================================
+function compute_relu_bounds(W1, b1, P_min, P_max, P_mean, P_std)
+    z0_min = (P_min - P_mean) / P_std
+    z0_max = (P_max - P_mean) / P_std
+
+    n_neurons = length(b1)
+    z_hat_min = zeros(Float32, n_neurons)
+    z_hat_max = zeros(Float32, n_neurons)
+
+    for i in 1:n_neurons
+        if W1[i] >= 0
+            z_hat_min[i] = W1[i] * z0_min + b1[i]
+            z_hat_max[i] = W1[i] * z0_max + b1[i]
+        else
+            z_hat_min[i] = W1[i] * z0_max + b1[i]
+            z_hat_max[i] = W1[i] * z0_min + b1[i]
+        end
+    end
+
+    return z_hat_min, z_hat_max
+end
+
+# ============================================================================
+# 5. OPTIMIZATION MODEL
+# ============================================================================
+function solve_dispatch(model_name, W1, b1, W2, b2, demand, cf_solar, cf_wind)
+    println("\n" * "="^80)
+    println("Solving with $model_name")
+    println("="^80)
+
+    n_neurons = length(b1)
+    println("   Architecture: 1 input → $n_neurons neurons (ReLU) → 1 output")
+
+    # Create model
+    model = Model(Gurobi.Optimizer)
+    set_optimizer_attribute(model, "OutputFlag", 1)
+    set_optimizer_attribute(model, "TimeLimit", 600)
+    set_optimizer_attribute(model, "MIPGap", 0.01)
+
+    println("   Creating variables...")
+
+    # Generator outputs
+    @variable(model, 0 <= P_solar[t=1:T] <= P_solar_cap * cf_solar[t])
+    @variable(model, 0 <= P_wind[t=1:T] <= P_wind_cap * cf_wind[t])
+    @variable(model, P_fossil[t=1:T])
+    @variable(model, 0 <= L_shed[t=1:T] <= demand[t])
+
+    # Fossil plant on/off status
+    @variable(model, u_fossil[t=1:T], Bin)
+
+    # Neural network variables
+    @variable(model, z0[t=1:T])
+    @variable(model, z_hat1[t=1:T, i=1:n_neurons])
+    @variable(model, z1[t=1:T, i=1:n_neurons] >= 0)
+    @variable(model, y1[t=1:T, i=1:n_neurons], Bin)
+    @variable(model, alpha_normalized[t=1:T])
+    @variable(model, alpha[t=1:T])
+
+    println("   Adding constraints...")
+
+    # Power balance
+    @constraint(model, power_balance[t=1:T],
+        P_solar[t] + P_wind[t] + P_fossil[t] + L_shed[t] == demand[t])
+
+    # Fossil plant bounds with binary on/off
+    @constraint(model, fossil_min[t=1:T],
+        P_fossil[t] >= P_fossil_min * u_fossil[t])
+    @constraint(model, fossil_max[t=1:T],
+        P_fossil[t] <= P_fossil_cap * u_fossil[t])
+
+    # Compute ReLU bounds
+    z_hat_min, z_hat_max = compute_relu_bounds(W1, b1, P_fossil_min, P_fossil_cap, P_mean, P_std)
+
+    println("   ReLU bounds computed:")
+    for i in 1:min(3, n_neurons)
+        @printf("     Neuron %d: [%.3f, %.3f]\n", i, z_hat_min[i], z_hat_max[i])
+    end
+
+    # Neural Network Constraints
+    for t in 1:T
+        # Input normalization
+        @constraint(model, z0[t] == (P_fossil[t] - P_mean) / P_std)
+
+        # Layer 1: Linear transformation
+        for i in 1:n_neurons
+            @constraint(model, z_hat1[t,i] == W1[i] * z0[t] + b1[i])
+        end
+
+        # Layer 1: ReLU activation (Big-M reformulation)
+        for i in 1:n_neurons
+            @constraint(model, z1[t,i] >= z_hat1[t,i])
+            @constraint(model, z1[t,i] <= z_hat1[t,i] - z_hat_min[i] * (1 - y1[t,i]))
+            @constraint(model, z1[t,i] <= z_hat_max[i] * y1[t,i])
+        end
+
+        # Output layer: Linear transformation
+        @constraint(model, alpha_normalized[t] == sum(W2[i] * z1[t,i] for i in 1:n_neurons) + b2[1])
+
+        # Denormalization
+        @constraint(model, alpha[t] == alpha_normalized[t] * alpha_std + alpha_mean)
+
+        # Ensure fuel consumption is non-negative (physical constraint)
+        @constraint(model, alpha[t] >= 0)
+    end
+
+    # Objective: Minimize total operational cost
+    @objective(model, Min,
+        sum(fuel_cost * alpha[t] + loadshed_cost * L_shed[t] for t in 1:T))
+
+    println("   Objective: Minimize Σ(4.0 × α[t] + 1000 × L_shed[t])")
+    println("   Total variables: $(num_variables(model))")
+
+    println("\n   Starting optimization...")
+    optimize!(model)
+
+    status = termination_status(model)
+    println("\n   Termination status: $status")
+
+    if status == MOI.OPTIMAL || status == MOI.LOCALLY_SOLVED
+        obj_value = objective_value(model)
+        solve_time_val = solve_time(model)
+        println("   ✓ Optimal solution found!")
+        @printf("   Solve time: %.2f seconds\n", solve_time_val)
+        @printf("   Total operational cost: \$%.2f\n", obj_value)
+
+        P_s = value.(P_solar)
+        P_w = value.(P_wind)
+        P_f = value.(P_fossil)
+        L_s = value.(L_shed)
+        alpha_vals = value.(alpha)
+        u_vals = value.(u_fossil)
+
+        total_loadshed = sum(L_s)
+        total_fuel = sum(alpha_vals)
+        fossil_hours = sum(u_vals .> 0.5)
+
+        @printf("   Total load shedding: %.2f MWh\n", total_loadshed)
+        @printf("   Total fuel consumption: %.2f MMBtu\n", total_fuel)
+        @printf("   Fossil plant operating hours: %d/24\n", fossil_hours)
+
+        return Dict(
+            "status" => status,
+            "objective" => obj_value,
+            "P_solar" => P_s,
+            "P_wind" => P_w,
+            "P_fossil" => P_f,
+            "L_shed" => L_s,
+            "alpha" => alpha_vals,
+            "u_fossil" => u_vals,
+            "demand" => demand,
+            "solve_time" => solve_time_val
+        )
+    else
+        println("   ✗ Optimization failed: $status")
+        return nothing
+    end
+end
+
+# ============================================================================
+# 6. SOLVE FOR BOTH MODELS
+# ============================================================================
+println("\n" * "="^80)
+println("SOLVING DISPATCH PROBLEMS")
+println("="^80)
+
+results_SM1 = solve_dispatch("SM1 (6 neurons)", W1_SM1, b1_SM1, W2_SM1, b2_SM1,
+                             demand, cf_solar, cf_wind)
+
+results_SM2 = solve_dispatch("SM2 (10 neurons)", W1_SM2, b1_SM2, W2_SM2, b2_SM2,
+                             demand, cf_solar, cf_wind)
+
+# ============================================================================
+# 7. COMPARISON AND VISUALIZATION
+# ============================================================================
+if !isnothing(results_SM1) && !isnothing(results_SM2)
+    println("\n" * "="^80)
+    println("RESULTS COMPARISON")
+    println("="^80)
+
+    println("\n📊 Total Operational Costs:")
+    @printf("   SM1 (6 neurons):  \$%.2f\n", results_SM1["objective"])
+    @printf("   SM2 (10 neurons): \$%.2f\n", results_SM2["objective"])
+    cost_diff = abs(results_SM1["objective"] - results_SM2["objective"])
+    pct = 100 * cost_diff / min(results_SM1["objective"], results_SM2["objective"])
+    @printf("   Difference: \$%.2f (%.2f%%)\n", cost_diff, pct)
+
+    better = results_SM1["objective"] < results_SM2["objective"] ? "SM1" : "SM2"
+    println("   ✓ $better gives lower operational cost")
+
+    println("\n📊 Energy Breakdown:")
+    @printf("   SM1 - Fossil: %.2f MWh, Solar: %.2f MWh, Wind: %.2f MWh\n",
+            sum(results_SM1["P_fossil"]), sum(results_SM1["P_solar"]), sum(results_SM1["P_wind"]))
+    @printf("   SM2 - Fossil: %.2f MWh, Solar: %.2f MWh, Wind: %.2f MWh\n",
+            sum(results_SM2["P_fossil"]), sum(results_SM2["P_solar"]), sum(results_SM2["P_wind"]))
+
+    println("\n📊 Fuel Consumption:")
+    @printf("   SM1: %.2f MMBtu (cost: \$%.2f)\n", sum(results_SM1["alpha"]), 4.0*sum(results_SM1["alpha"]))
+    @printf("   SM2: %.2f MMBtu (cost: \$%.2f)\n", sum(results_SM2["alpha"]), 4.0*sum(results_SM2["alpha"]))
+
+    # Create visualization
+    hours = 1:T
+
+    p1 = plot(hours, results_SM1["P_fossil"], label="SM1", linewidth=2, color=:red,
+              title="Fossil Generation", xlabel="Hour", ylabel="Power (MW)", legend=:topleft)
+    plot!(p1, hours, results_SM2["P_fossil"], label="SM2", linewidth=2, color=:blue, linestyle=:dash)
+
+    p2 = plot(hours, results_SM1["P_solar"], label="Solar", linewidth=2, color=:orange,
+              title="Renewable Generation", xlabel="Hour", ylabel="Power (MW)", legend=:topleft)
+    plot!(p2, hours, results_SM1["P_wind"], label="Wind", linewidth=2, color=:green)
+
+    p3 = plot(hours, demand, label="Demand", linewidth=2, linestyle=:dash, color=:black,
+              title="Power Balance (SM1)", xlabel="Hour", ylabel="Power (MW)", legend=:topleft)
+    plot!(p3, hours, results_SM1["P_fossil"] .+ results_SM1["P_solar"] .+ results_SM1["P_wind"],
+          label="Total Gen", linewidth=2, color=:purple)
+
+    p4 = plot(hours, results_SM1["alpha"], label="SM1", linewidth=2, color=:red,
+              title="Fuel Consumption", xlabel="Hour", ylabel="MMBtu/h", legend=:topleft)
+    plot!(p4, hours, results_SM2["alpha"], label="SM2", linewidth=2, color=:blue, linestyle=:dash)
+
+    plot(p1, p2, p3, p4, layout=(2,2), size=(1200, 800))
+    savefig("dispatch_results_comparison.png")
+    println("\n   ✓ Plot saved as 'dispatch_results_comparison.png'")
+
+    # Summary table
+    println("\n📋 Hourly Dispatch Schedule (SM1 vs SM2):")
+    println("="^80)
+    println("┌──────┬─────────┬──────────────────────────┬──────────────────────────┐")
+    println("│ Hour │ Demand  │   SM1 Fossil (Fuel)      │   SM2 Fossil (Fuel)      │")
+    println("│      │  (MW)   │   MW    (MMBtu/h)        │   MW    (MMBtu/h)        │")
+    println("├──────┼─────────┼──────────────────────────┼──────────────────────────┤")
+    for t in 1:T
+        @printf("│  %2d  │ %7.1f │ %7.1f  (%6.1f)      │ %7.1f  (%6.1f)      │\n",
+                t, demand[t], results_SM1["P_fossil"][t], results_SM1["alpha"][t],
+                results_SM2["P_fossil"][t], results_SM2["alpha"][t])
+    end
+    println("└──────┴─────────┴──────────────────────────┴──────────────────────────┘")
+
+    println("\n" * "="^80)
+    println("✓ QUESTION 2 PART B COMPLETE!")
+    println("="^80)
+    println("\n📝 Key Findings:")
+    println("   • SM1 validation MSE: 261.61")
+    println("   • SM2 validation MSE: 86.13")
+    println("   • SM2 has better approximation accuracy (lower MSE)")
+    @printf("   • Total cost difference: \$%.2f (%.2f%%)\n", cost_diff, pct)
+    println("   • Both models respect minimum fossil output constraint (160 MW)")
+    println("   • $better provides lower operational cost")
+    println("="^80)
+else
+    println("\n⚠️  One or both optimizations failed.")
+    println("   Check Gurobi license and solver output above.")
+end
