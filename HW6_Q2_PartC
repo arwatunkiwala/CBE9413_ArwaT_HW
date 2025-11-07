@@ -1,0 +1,387 @@
+using JuMP, Gurobi, CSV, DataFrames, Plots, Printf, Downloads
+
+println("="^80)
+println("QUESTION 2 PART C: OPTIMAL DISPATCH WITH PIECEWISE-LINEAR APPROXIMATION")
+println("="^80)
+
+# ============================================================================
+# 1. LOAD TIME SERIES DATA
+# ============================================================================
+println("\n1. Loading time series data...")
+println("-"^80)
+
+data_url = "https://raw.githubusercontent.com/dharik13/CBE9413-Energy-Systems/main/Approximations/HW6/demand_vre_time_series.csv"
+data_file = "demand_vre_time_series.csv"
+
+if !isfile(data_file)
+    println("   Downloading data from GitHub...")
+    Downloads.download(data_url, data_file)
+end
+
+data = CSV.read(data_file, DataFrame)
+println("   Data loaded: $(nrow(data)) hours")
+
+T = nrow(data)
+demand = data.Demand_MW
+cf_solar = data.Solar_CF
+cf_wind = data.Wind_CF
+
+# ============================================================================
+# 2. SYSTEM PARAMETERS
+# ============================================================================
+println("\n2. System parameters...")
+println("-"^80)
+
+P_solar_cap = 400.0
+P_wind_cap = 400.0
+P_fossil_cap = 800.0
+P_fossil_min = 160.0
+
+a = -1e-06
+b = 1.2e-03
+c = 1.30
+d = 200.0
+a1 = 2e-07
+b1 = 1e-03
+c1 = 1.15
+d1 = 215.2
+
+fuel_cost = 4.0
+loadshed_cost = 1000.0
+
+println("   Fossil plant capacity: $P_fossil_cap MW")
+println("   Fossil plant minimum: $P_fossil_min MW")
+println("   Solar capacity: $P_solar_cap MW")
+println("   Wind capacity: $P_wind_cap MW")
+println("   Fuel cost: $fuel_cost \$/MMBtu")
+println("   Load shedding cost: $loadshed_cost \$/MWh")
+
+# ============================================================================
+# 3. DEFINE TRUE FUEL CONSUMPTION FUNCTION
+# ============================================================================
+println("\n3. Defining true fuel consumption function...")
+println("-"^80)
+
+function alpha_f(P)
+    if P < 160.0
+        return 0.0
+    elseif 160.0 <= P <= 400.0
+        return (a + b) * P^2 + c * P + d
+    elseif 400.0 < P <= 800.0
+        return a1 * P^3 + b1 * P^2 + c1 * P + d1
+    else
+        return 0.0
+    end
+end
+
+println("   Fuel consumption function α_f(P) defined")
+
+# ============================================================================
+# 4. CREATE PIECEWISE-LINEAR APPROXIMATION (6 SEGMENTS)
+# ============================================================================
+println("\n4. Creating piecewise-linear approximation...")
+println("-"^80)
+
+n_segments = 6
+P_breakpoints = collect(range(P_fossil_min, P_fossil_cap, length=n_segments+1))
+alpha_breakpoints = [alpha_f(P) for P in P_breakpoints]
+
+println("   Number of segments: $n_segments")
+println("\n   Breakpoint values:")
+for i in 1:length(P_breakpoints)
+    @printf("   P = %6.1f MW → α_f = %7.2f MMBtu/h\n", P_breakpoints[i], alpha_breakpoints[i])
+end
+
+# ============================================================================
+# 5. OPTIMIZATION MODEL WITH PIECEWISE-LINEAR APPROXIMATION
+# ============================================================================
+function solve_dispatch_pwl(demand, cf_solar, cf_wind)
+    println("\n" * "="^80)
+    println("Solving with Piecewise-Linear Approximation ($n_segments segments)")
+    println("="^80)
+
+    model = Model(Gurobi.Optimizer)
+    set_optimizer_attribute(model, "OutputFlag", 1)
+    set_optimizer_attribute(model, "TimeLimit", 600)
+    set_optimizer_attribute(model, "MIPGap", 0.01)
+
+    println("   Creating variables...")
+
+    @variable(model, 0 <= P_solar[t=1:T] <= P_solar_cap * cf_solar[t])
+    @variable(model, 0 <= P_wind[t=1:T] <= P_wind_cap * cf_wind[t])
+    @variable(model, P_fossil[t=1:T] >= 0)
+    @variable(model, 0 <= L_shed[t=1:T] <= demand[t])
+    @variable(model, u_fossil[t=1:T], Bin)
+    @variable(model, 0 <= lambda[t=1:T, i=1:n_segments+1] <= 1)
+    @variable(model, alpha[t=1:T] >= 0)
+
+    println("   Adding constraints...")
+
+    @constraint(model, power_balance[t=1:T],
+        P_solar[t] + P_wind[t] + P_fossil[t] + L_shed[t] == demand[t])
+    @constraint(model, fossil_min[t=1:T],
+        P_fossil[t] >= P_fossil_min * u_fossil[t])
+    @constraint(model, fossil_max[t=1:T],
+        P_fossil[t] <= P_fossil_cap * u_fossil[t])
+
+    for t in 1:T
+        @constraint(model, sum(lambda[t, i] for i in 1:n_segments+1) == u_fossil[t])
+        @constraint(model, P_fossil[t] == sum(P_breakpoints[i] * lambda[t, i] for i in 1:n_segments+1))
+        @constraint(model, alpha[t] == sum(alpha_breakpoints[i] * lambda[t, i] for i in 1:n_segments+1))
+        @constraint(model, lambda[t, :] in SOS2())
+    end
+
+    @objective(model, Min,
+        sum(fuel_cost * alpha[t] + loadshed_cost * L_shed[t] for t in 1:T))
+
+    println("   Starting optimization...")
+    optimize!(model)
+
+    status = termination_status(model)
+    println("\n   Termination status: $status")
+
+    if status == MOI.OPTIMAL || status == MOI.LOCALLY_SOLVED
+        obj_value = objective_value(model)
+        solve_time_val = solve_time(model)
+        println("   Optimal solution found!")
+        @printf("   Solve time: %.2f seconds\n", solve_time_val)
+        @printf("   Total operational cost: \$%.2f\n", obj_value)
+
+        P_s = value.(P_solar)
+        P_w = value.(P_wind)
+        P_f = value.(P_fossil)
+        L_s = value.(L_shed)
+        alpha_vals = value.(alpha)
+        u_vals = value.(u_fossil)
+
+        @printf("   Total load shedding: %.2f MWh\n", sum(L_s))
+        @printf("   Total fuel consumption: %.2f MMBtu\n", sum(alpha_vals))
+        @printf("   Fossil plant operating hours: %d/%d\n", sum(u_vals .> 0.5), T)
+
+        return Dict(
+            "status" => status,
+            "objective" => obj_value,
+            "P_solar" => P_s,
+            "P_wind" => P_w,
+            "P_fossil" => P_f,
+            "L_shed" => L_s,
+            "alpha" => alpha_vals,
+            "u_fossil" => u_vals,
+            "demand" => demand,
+            "solve_time" => solve_time_val
+        )
+    else
+        println("   Optimization failed: $status")
+        return nothing
+    end
+end
+
+# ============================================================================
+# 6. SOLVE THE PROBLEM
+# ============================================================================
+results_PWL = solve_dispatch_pwl(demand, cf_solar, cf_wind)
+
+# ============================================================================
+# 7. LOAD PART B RESULTS FOR COMPARISON
+# ============================================================================
+println("\n" * "="^80)
+println("LOADING PART B RESULTS FOR COMPARISON")
+println("="^80)
+
+SM1_objective = 233930.59
+SM2_objective = 164422.50
+
+SM1_fossil = [380.0, 360.0, 350.0, 340.0, 360.0, 420.0, 520.0, 640.0, 710.0, 711.9, 
+              711.9, 711.9, 711.9, 711.8, 700.0, 711.9, 711.9, 711.9, 746.0, 712.0, 
+              711.9, 700.0, 600.0, 480.0]
+
+SM1_fuel = [3012.5, 3065.0, 3091.3, 3117.5, 3065.0, 2907.6, 2645.2, 2330.4, 2146.7, 2142.0,
+            2142.0, 2142.0, 2142.0, 2142.1, 2173.0, 2142.0, 2142.0, 2142.0, 2150.2, 2142.0,
+            2142.0, 2173.0, 2435.3, 2750.2]
+
+SM2_fossil = [357.8, 357.8, 350.0, 340.0, 357.8, 357.8, 357.8, 640.0, 358.0, 357.8,
+              780.0, 790.0, 770.0, 357.8, 700.0, 720.0, 800.0, 800.0, 800.0, 800.0,
+              800.0, 700.0, 600.0, 357.8]
+
+SM2_fuel = [1680.0, 1680.0, 1829.8, 2020.6, 1680.0, 1680.0, 1680.0, 2305.4, 1701.7, 1680.0,
+            1548.7, 1443.0, 1654.5, 1680.0, 2025.7, 1932.5, 1337.2, 1337.2, 1337.2, 1337.2,
+            1337.2, 2025.7, 2491.9, 1680.0]
+
+SM1_total_fossil = 14424.62
+SM1_total_fuel = 58482.65
+SM2_total_fossil = 13610.80
+SM2_total_fuel = 41105.63
+
+println("   Part B results loaded")
+println("   SM1 objective: \$$SM1_objective")
+println("   SM2 objective: \$$SM2_objective")
+
+# ============================================================================
+# 8. RESULTS AND COMPARISON
+# ============================================================================
+if !isnothing(results_PWL)
+    println("\n" * "="^80)
+    println("RESULTS SUMMARY")
+    println("="^80)
+    
+    println("\nObjective Values (Total Cost):")
+    @printf("   SM1: \$%.2f\n", SM1_objective)
+    @printf("   SM2: \$%.2f\n", SM2_objective)
+    @printf("   PWL: \$%.2f\n", results_PWL["objective"])
+    
+    println("\nFuel Consumption (MMBtu):")
+    @printf("   SM1: %.2f\n", SM1_total_fuel)
+    @printf("   SM2: %.2f\n", SM2_total_fuel)
+    @printf("   PWL: %.2f\n", sum(results_PWL["alpha"]))
+    
+    println("\nFossil Generation (MWh):")
+    @printf("   SM1: %.2f\n", SM1_total_fossil)
+    @printf("   SM2: %.2f\n", SM2_total_fossil)
+    @printf("   PWL: %.2f\n", sum(results_PWL["P_fossil"]))
+    
+    println("\nRenewable Generation (MWh):")
+    @printf("   Solar: %.2f\n", sum(results_PWL["P_solar"]))
+    @printf("   Wind: %.2f\n", sum(results_PWL["P_wind"]))
+    
+    println("\nLoad Shedding (MWh):")
+    @printf("   PWL: %.2f\n", sum(results_PWL["L_shed"]))
+
+    # ========================================================================
+    # HOURLY COMPARISON TABLE
+    # ========================================================================
+    println("\n" * "="^80)
+    println("HOURLY DISPATCH COMPARISON")
+    println("="^80)
+    println("Hour | Demand | SM1_Fossil | SM1_Fuel | SM2_Fossil | SM2_Fuel | PWL_Fossil | PWL_Fuel")
+    println("-"^80)
+    for t in 1:T
+        @printf("%4d | %6.1f | %10.1f | %8.1f | %10.1f | %8.1f | %10.1f | %8.1f\n",
+                t, demand[t], SM1_fossil[t], SM1_fuel[t], 
+                SM2_fossil[t], SM2_fuel[t], 
+                results_PWL["P_fossil"][t], results_PWL["alpha"][t])
+    end
+
+    # ========================================================================
+    # VISUALIZATIONS
+    # ========================================================================
+    println("\n" * "="^80)
+    println("CREATING VISUALIZATIONS")
+    println("="^80)
+
+    hours = 1:T
+
+    # PWL approximation quality
+    P_plot = range(P_fossil_min, P_fossil_cap, length=200)
+    alpha_true = [alpha_f(P) for P in P_plot]
+    
+    function alpha_pwl(P)
+        for i in 1:n_segments
+            if P_breakpoints[i] <= P <= P_breakpoints[i+1]
+                w = (P - P_breakpoints[i]) / (P_breakpoints[i+1] - P_breakpoints[i])
+                return (1 - w) * alpha_breakpoints[i] + w * alpha_breakpoints[i+1]
+            end
+        end
+        return alpha_f(P)
+    end
+    
+    alpha_approx = [alpha_pwl(P) for P in P_plot]
+    
+    p_approx = plot(P_plot, alpha_true, label="True α_f(P)", linewidth=2, color=:black,
+                    title="Piecewise-Linear Approximation Quality",
+                    xlabel="Power Output (MW)", ylabel="Fuel Consumption (MMBtu/h)",
+                    legend=:topleft)
+    plot!(p_approx, P_plot, alpha_approx, label="PWL Approximation ($n_segments segments)", 
+          linewidth=2, color=:red, linestyle=:dash)
+    scatter!(p_approx, P_breakpoints, alpha_breakpoints, label="Breakpoints", 
+             markersize=6, color=:blue)
+    
+    savefig(p_approx, "pwl_approximation_quality.png")
+    println("   Plot saved: pwl_approximation_quality.png")
+
+    # PWL dispatch stacked area
+    p1 = areaplot(hours, 
+                  [results_PWL["P_fossil"] results_PWL["P_wind"] results_PWL["P_solar"]],
+                  labels=["Fossil" "Wind" "Solar"],
+                  title="PWL (6 segments) - Hourly Generation by Technology",
+                  xlabel="Hour",
+                  ylabel="Power (MW)",
+                  color=[:red :green :orange],
+                  alpha=0.7,
+                  legend=:topleft)
+    plot!(p1, hours, demand, label="Demand", linewidth=2, linestyle=:dash, color=:black)
+
+    p2 = plot(hours, results_PWL["P_fossil"], label="Fossil", linewidth=2, color=:red,
+              title="Fossil Generation", xlabel="Hour", ylabel="Power (MW)", legend=:topleft)
+    
+    p3 = plot(hours, results_PWL["P_solar"], label="Solar", linewidth=2, color=:orange,
+              title="Renewable Generation", xlabel="Hour", ylabel="Power (MW)", legend=:topleft)
+    plot!(p3, hours, results_PWL["P_wind"], label="Wind", linewidth=2, color=:green)
+
+    p4 = plot(hours, results_PWL["alpha"], label="Fuel Consumption", linewidth=2, color=:red,
+              title="Fuel Consumption", xlabel="Hour", ylabel="MMBtu/h", legend=:topleft)
+
+    plot(p1, p2, p3, p4, layout=(2,2), size=(1400, 900))
+    savefig("dispatch_results_pwl.png")
+    println("   Plot saved: dispatch_results_pwl.png")
+
+    # Comparison plots
+    SM1_solar_hourly = P_solar_cap * cf_solar
+    SM1_wind_hourly = P_wind_cap * cf_wind
+    SM2_solar_hourly = P_solar_cap * cf_solar
+    SM2_wind_hourly = P_wind_cap * cf_wind
+    
+    p1 = areaplot(hours, 
+                  [SM1_fossil SM1_wind_hourly SM1_solar_hourly],
+                  labels=["Fossil" "Wind" "Solar"],
+                  title="SM1 (6 neurons) - Hourly Generation",
+                  xlabel="Hour", ylabel="Power (MW)",
+                  color=[:red :green :orange], alpha=0.7, legend=:topleft, size=(450, 300))
+    plot!(p1, hours, demand, label="Demand", linewidth=2, linestyle=:dash, color=:black)
+    
+    p2 = areaplot(hours, 
+                  [SM2_fossil SM2_wind_hourly SM2_solar_hourly],
+                  labels=["Fossil" "Wind" "Solar"],
+                  title="SM2 (10 neurons) - Hourly Generation",
+                  xlabel="Hour", ylabel="Power (MW)",
+                  color=[:red :green :orange], alpha=0.7, legend=:topleft, size=(450, 300))
+    plot!(p2, hours, demand, label="Demand", linewidth=2, linestyle=:dash, color=:black)
+    
+    p3 = areaplot(hours, 
+                  [results_PWL["P_fossil"] results_PWL["P_wind"] results_PWL["P_solar"]],
+                  labels=["Fossil" "Wind" "Solar"],
+                  title="PWL (6 segments) - Hourly Generation",
+                  xlabel="Hour", ylabel="Power (MW)",
+                  color=[:red :green :orange], alpha=0.7, legend=:topleft, size=(450, 300))
+    plot!(p3, hours, demand, label="Demand", linewidth=2, linestyle=:dash, color=:black)
+    
+    p4 = plot(hours, SM1_fuel, label="SM1", linewidth=2, color=:red,
+              title="Fuel Consumption Comparison", xlabel="Hour", ylabel="MMBtu/h", 
+              legend=:topright, size=(450, 300))
+    plot!(p4, hours, SM2_fuel, label="SM2", linewidth=2, color=:blue)
+    plot!(p4, hours, results_PWL["alpha"], label="PWL", linewidth=2, color=:green, linestyle=:dash)
+    
+    p5 = plot(hours, SM1_fossil, label="SM1", linewidth=2, color=:red,
+              title="Fossil Generation Comparison", xlabel="Hour", ylabel="Power (MW)", 
+              legend=:topright, size=(450, 300))
+    plot!(p5, hours, SM2_fossil, label="SM2", linewidth=2, color=:blue)
+    plot!(p5, hours, results_PWL["P_fossil"], label="PWL", linewidth=2, color=:green, linestyle=:dash)
+    
+    model_names = ["SM1", "SM2", "PWL"]
+    fuel_costs = [SM1_total_fuel * 4.0, SM2_total_fuel * 4.0, sum(results_PWL["alpha"]) * 4.0]
+    
+    p6 = bar(1:3, fuel_costs,
+             title="Fuel Cost Comparison", xlabel="Model", ylabel="Cost (\$)",
+             xticks=(1:3, model_names), legend=false, color=:red, size=(450, 300))
+    
+    plot(p1, p2, p3, p4, p5, p6, layout=(3,2), size=(1400, 1200))
+    savefig("comparison_all_models.png")
+    println("   Plot saved: comparison_all_models.png")
+
+    println("\n" * "="^80)
+    println("ANALYSIS COMPLETE")
+    println("="^80)
+    
+else
+    println("\nPWL optimization failed")
+    println("Check Gurobi license and solver output")
+end
