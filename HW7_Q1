@@ -1,0 +1,259 @@
+using JuMP, Gurobi, CSV, DataFrames
+
+# ============================================================================
+# DISTRICT HEATING OPTIMIZATION WITH PIECEWISE MCCORMICK ENVELOPES
+# ============================================================================
+
+# Load demand data
+demand_data = CSV.read("heat_demand_MW.csv", DataFrame)
+demand = demand_data[:, 1]  # Assuming first column is demand in MW
+
+# Parameters
+T = 168  # Time horizon (hours)
+a = 35.0  # Cost coefficient ($/MWh)
+b = 1.2   # Quadratic cost coefficient ($/(MWh)^2)
+Q_max = 12.5  # Plant capacity (MW)
+c_p = 4.18    # Specific heat capacity (kJ/kg·K)
+
+# Mass flow rate breakpoints (kg/s)
+m_bp = [10.0, 50.0, 150.0, 300.0]
+K = length(m_bp) - 1  # Number of partitions = 3
+
+# Temperature difference breakpoints (°C)
+T_bp = [10.0, 15.0, 20.0]
+L = length(T_bp) - 1  # Number of partitions = 2
+
+# Ramping constraint
+delta_max = 50.0  # Max mass flow rate change (kg/s)
+
+# Storage parameters
+P_c = 50.0   # Charging capacity (MW)
+P_d = 50.0   # Discharging capacity (MW)
+E_cap = 200.0  # Energy capacity (MWh)
+eta_c = 0.95   # Charging efficiency
+eta_d = 0.95   # Discharging efficiency
+
+# ============================================================================
+# FUNCTION TO SOLVE MODEL
+# ============================================================================
+function solve_district_heating(use_storage::Bool)
+
+    model = Model(Gurobi.Optimizer)
+    set_optimizer_attribute(model, "TimeLimit", 600)
+    set_optimizer_attribute(model, "MIPGap", 0.02)
+    set_optimizer_attribute(model, "OutputFlag", 1)
+
+    # ========================================================================
+    # DECISION VARIABLES
+    # ========================================================================
+
+    # Heat production and storage
+    @variable(model, q[1:T] >= 0)  # Heat production (MW)
+    @variable(model, r_c[1:T] >= 0)  # Charging rate (MW)
+    @variable(model, r_d[1:T] >= 0)  # Discharging rate (MW)
+    @variable(model, I[1:T] >= 0)    # Storage inventory (MWh)
+
+    # Mass flow rate and temperature
+    @variable(model, m_bp[1] <= m_actual[1:T] <= m_bp[end])
+    @variable(model, T_bp[1] <= T_actual[1:T] <= T_bp[end])
+
+    # Piecewise McCormick variables
+    N_rect = K * L  # Total rectangles = 3 * 2 = 6
+    @variable(model, lambda[1:T, 1:N_rect], Bin)  # Binary for each rectangle
+    @variable(model, r[1:T, 1:N_rect] >= 0)  # Mass auxiliary variable
+    @variable(model, s[1:T, 1:N_rect] >= 0)  # Temperature auxiliary variable
+
+    # Piecewise linear objective approximation (N=10 segments)
+    N_obj = 10
+    q_obj_bp = range(0, Q_max, length=N_obj+1)
+    cost_bp = [a*q + b*q^2 for q in q_obj_bp]
+
+    @variable(model, 0 <= beta[1:T, 1:N_obj+1] <= 1)  # SOS2 weights
+    @variable(model, h[1:T, 1:N_obj], Bin)  # Segment indicators
+
+    # ========================================================================
+    # OBJECTIVE FUNCTION - Piecewise Linear Approximation
+    # ========================================================================
+
+    @objective(model, Min, sum(
+        sum(beta[t,i] * cost_bp[i] for i in 1:N_obj+1) for t in 1:T
+    ))
+
+    # ========================================================================
+    # CONSTRAINTS
+    # ========================================================================
+
+    # 1. Energy balance
+    for t in 1:T
+        if use_storage
+            @constraint(model, q[t] + r_d[t] - r_c[t] >= demand[t])
+        else
+            @constraint(model, q[t] >= demand[t])
+            @constraint(model, r_c[t] == 0)
+            @constraint(model, r_d[t] == 0)
+        end
+    end
+
+    # 2. Production capacity
+    @constraint(model, [t=1:T], q[t] <= Q_max)
+
+    # 3. Storage constraints
+    if use_storage
+        @constraint(model, [t=1:T], r_c[t] <= P_c)
+        @constraint(model, [t=1:T], r_d[t] <= P_d)
+        @constraint(model, [t=1:T], I[t] <= E_cap)
+
+        # Storage inventory balance
+        @constraint(model, I[1] == eta_c * r_c[1] - r_d[1] / eta_d)
+        for t in 2:T
+            @constraint(model, I[t] == I[t-1] + eta_c * r_c[t] - r_d[t] / eta_d)
+        end
+    else
+        @constraint(model, [t=1:T], I[t] == 0)
+    end
+
+    # 4. Ramping constraints
+    for t in 2:T
+        @constraint(model, m_actual[t] - m_actual[t-1] <= delta_max)
+        @constraint(model, m_actual[t] - m_actual[t-1] >= -delta_max)
+    end
+
+    # 5. Piecewise linear objective approximation (SOS2)
+    for t in 1:T
+        # Heat supply as convex combination
+        @constraint(model, q[t] == sum(beta[t,i] * q_obj_bp[i] for i in 1:N_obj+1))
+
+        # Weights sum to 1
+        @constraint(model, sum(beta[t,i] for i in 1:N_obj+1) == 1)
+
+        # SOS2: only consecutive weights non-zero
+        for i in 1:N_obj+1
+            if i == 1
+                @constraint(model, beta[t,i] <= h[t,1])
+            elseif i == N_obj+1
+                @constraint(model, beta[t,i] <= h[t,N_obj])
+            else
+                @constraint(model, beta[t,i] <= h[t,i-1] + h[t,i])
+            end
+        end
+
+        # Exactly one segment active
+        @constraint(model, sum(h[t,i] for i in 1:N_obj) == 1)
+    end
+
+    # 6. Piecewise McCormick envelopes for q = c_p * m * ΔT
+    for t in 1:T
+        # Mass flow rate decomposition
+        @constraint(model, m_actual[t] == sum(r[t,i] for i in 1:N_rect))
+
+        # Temperature decomposition
+        @constraint(model, T_actual[t] == sum(s[t,i] for i in 1:N_rect))
+
+        # Exactly one rectangle active
+        @constraint(model, sum(lambda[t,i] for i in 1:N_rect) == 1)
+
+        # Rectangle bounds and McCormick envelopes
+        rect_idx = 1
+        for k in 1:K
+            for l in 1:L
+                # Bounds on auxiliary variables
+                @constraint(model, r[t,rect_idx] >= m_bp[k] * lambda[t,rect_idx])
+                @constraint(model, r[t,rect_idx] <= m_bp[k+1] * lambda[t,rect_idx])
+                @constraint(model, s[t,rect_idx] >= T_bp[l] * lambda[t,rect_idx])
+                @constraint(model, s[t,rect_idx] <= T_bp[l+1] * lambda[t,rect_idx])
+
+                # McCormick envelopes (convert to MWh: divide by 3600)
+                m_L, m_U = m_bp[k], m_bp[k+1]
+                T_L, T_U = T_bp[l], T_bp[l+1]
+
+                # Lower bounds
+                @constraint(model,
+                    q[t] * 3600 / c_p >= r[t,rect_idx] * T_U + s[t,rect_idx] * m_L - m_L * T_U * lambda[t,rect_idx]
+                )
+                @constraint(model,
+                    q[t] * 3600 / c_p >= r[t,rect_idx] * T_L + s[t,rect_idx] * m_U - m_U * T_L * lambda[t,rect_idx]
+                )
+
+                # Upper bounds
+                @constraint(model,
+                    q[t] * 3600 / c_p <= r[t,rect_idx] * T_L + s[t,rect_idx] * m_L - m_L * T_L * lambda[t,rect_idx]
+                )
+                @constraint(model,
+                    q[t] * 3600 / c_p <= r[t,rect_idx] * T_U + s[t,rect_idx] * m_U - m_U * T_U * lambda[t,rect_idx]
+                )
+
+                rect_idx += 1
+            end
+        end
+    end
+
+    # ========================================================================
+    # SOLVE
+    # ========================================================================
+
+    optimize!(model)
+
+    # ========================================================================
+    # EXTRACT RESULTS
+    # ========================================================================
+
+    status = termination_status(model)
+    if status in [MOI.OPTIMAL, MOI.LOCALLY_SOLVED]
+        total_cost = objective_value(model)
+        q_vals = value.(q)
+        return (
+            status = status,
+            cost = total_cost,
+            q = q_vals,
+            m = value.(m_actual),
+            T = value.(T_actual),
+            r_c = value.(r_c),
+            r_d = value.(r_d),
+            I = value.(I)
+        )
+    else
+        println("Optimization failed with status: $status")
+        return nothing
+    end
+end
+
+# ============================================================================
+# MAIN EXECUTION
+# ============================================================================
+
+println("="^70)
+println("SOLVING WITHOUT STORAGE...")
+println("="^70)
+result_no_storage = solve_district_heating(false)
+
+println("\n" * "="^70)
+println("SOLVING WITH STORAGE...")
+println("="^70)
+result_with_storage = solve_district_heating(true)
+
+# ============================================================================
+# COMPARE RESULTS
+# ============================================================================
+
+if !isnothing(result_no_storage) && !isnothing(result_with_storage)
+    println("\n" * "="^70)
+    println("RESULTS SUMMARY")
+    println("="^70)
+    println("Operating cost WITHOUT storage: \$$(round(result_no_storage.cost, digits=2))")
+    println("Operating cost WITH storage:    \$$(round(result_with_storage.cost, digits=2))")
+
+    savings = result_no_storage.cost - result_with_storage.cost
+    savings_pct = 100 * savings / result_no_storage.cost
+
+    println("\nCost savings: \$$(round(savings, digits=2)) ($(round(savings_pct, digits=2))%)")
+
+    if savings > 0
+        println("\n✓ RECOMMENDATION: Install storage - positive cost savings!")
+    else
+        println("\n✗ RECOMMENDATION: Do NOT install storage - no cost benefit")
+    end
+
+    println("\nPeak storage inventory: $(round(maximum(result_with_storage.I), digits=2)) MWh")
+    println("Max charging rate: $(round(maximum(result_with_storage.r_c), digits=2)) MW")
+    println("Max discharging rate: $(round(maximum(result_with_storage.r_d), digits=2)) MW")
+end
