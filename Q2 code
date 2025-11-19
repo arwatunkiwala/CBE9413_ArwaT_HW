@@ -1,0 +1,310 @@
+using CSV, DataFrames
+using JuMP, Gurobi
+using Plots
+using Statistics
+
+# ---------------------------------------------------------------------------
+# FILE PATHS
+gen_path = "/content/q2_generator_data-2.csv"
+demand_path = "/content/q2_demand_cf.csv"
+
+# ---------------------------------------------------------------------------
+# READ CSV FILES
+gen_data = CSV.read(gen_path, DataFrame)
+demand_cf_data = CSV.read(demand_path, DataFrame)
+
+# ---------------------------------------------------------------------------
+# FIX GENERATOR CSV
+# Rename the generator name column
+rename!(gen_data, "Column1" => "Name")
+
+# SAFE RAMP-RATE CLEANING (works with "-", Int64, String, missing)
+gen_data[!, "Ramp rate (MW/h)"] = [
+    x == "-" ? 9999.0 : parse(Float64, string(x))
+    for x in gen_data[!, "Ramp rate (MW/h)"]
+]
+
+# ---------------------------------------------------------------------------
+# DETECT AND SEPARATE WIND GENERATOR
+wind_row = findfirst(x -> occursin(r"(?i)wind", x), gen_data[!, "Name"])
+
+if wind_row === nothing
+    error("No wind generator found — cannot detect wind capacity.")
+end
+
+wind_capacity = gen_data[wind_row, "MaxCap (MW)"]
+print("Detected wind capacity = ")
+print(wind_capacity)
+println(" MW")
+
+# Create thermal-only generator data (excluding wind)
+thermal_indices = setdiff(1:nrow(gen_data), wind_row)
+thermal_data = gen_data[thermal_indices, :]
+
+# ---------------------------------------------------------------------------
+# EXTRACT THERMAL GENERATOR DATA
+P_max = Float64.(thermal_data[!, "MaxCap (MW)"])
+P_min = Float64.(thermal_data[!, "Min Output (MW)"])
+mc    = Float64.(thermal_data[!, "Marginal Cost (d_p_MWh)"])
+startup_cost = Float64.(thermal_data[!, "Startup cost (d)"])
+ramp_rate    = Float64.(thermal_data[!, "Ramp rate (MW/h)"])
+
+n_gen = length(P_max)
+print("Number of thermal generators = ")
+println(n_gen)
+
+# ---------------------------------------------------------------------------
+# READ DEMAND + WIND CF
+demand = Float64.(demand_cf_data[!, "Load"])
+wind_cf = Float64.(demand_cf_data[!, "WindCF"])
+T = length(demand)
+
+wind_available = wind_capacity .* wind_cf
+
+# ---------------------------------------------------------------------------
+# MODEL SOLVING FUNCTIONS
+
+function solve_dispatch(use_ramping::Bool)
+    model = Model(Gurobi.Optimizer)
+    set_optimizer_attribute(model, "OutputFlag", 0)
+
+    @variable(model, P[1:n_gen, 1:T] >= 0)
+    @variable(model, u[1:n_gen, 1:T], Bin)
+    @variable(model, v[1:n_gen, 1:T], Bin)
+    @variable(model, w[1:n_gen, 1:T], Bin)
+    @variable(model, 0 <= wind_dispatch[1:T] <= wind_capacity)
+    @variable(model, wind_curtail[1:T] >= 0)
+
+    @objective(model, Min,
+        sum(mc[g] * P[g,t] for g=1:n_gen, t=1:T) +
+        sum(startup_cost[g] * v[g,t] for g=1:n_gen, t=1:T)
+    )
+
+    # Supply-demand balance
+    @constraint(model, balance[t=1:T],
+        sum(P[g,t] for g in 1:n_gen) + wind_dispatch[t] == demand[t]
+    )
+
+    # Generator limits
+    for g in 1:n_gen, t in 1:T
+        @constraint(model, P[g,t] <= P_max[g] * u[g,t])
+        @constraint(model, P[g,t] >= P_min[g] * u[g,t])
+    end
+
+    # Wind availability
+    @constraint(model, [t=1:T],
+        wind_dispatch[t] + wind_curtail[t] == wind_available[t]
+    )
+
+    # Startup/shutdown logic with cyclic constraint (t=0 state = t=24 state)
+    for g in 1:n_gen
+        # First hour: compare with last hour (t=24) for cyclic constraint
+        @constraint(model, v[g,1] >= u[g,1] - u[g,T])
+        @constraint(model, w[g,1] >= u[g,T] - u[g,1])
+
+        for t in 2:T
+            @constraint(model, v[g,t] >= u[g,t] - u[g,t-1])
+            @constraint(model, w[g,t] >= u[g,t-1] - u[g,t])
+        end
+    end
+
+    @constraint(model, [g=1:n_gen, t=1:T], v[g,t] + w[g,t] <= 1)
+
+    # RAMPING CONSTRAINTS
+    if use_ramping
+        for g in 1:n_gen
+            # Ramping between consecutive hours
+            for t in 2:T
+                @constraint(model, P[g,t] - P[g,t-1] <= ramp_rate[g])
+                @constraint(model, P[g,t-1] - P[g,t] <= ramp_rate[g])
+            end
+            
+            # Cyclic ramping: between t=24 and t=1
+            @constraint(model, P[g,1] - P[g,T] <= ramp_rate[g])
+            @constraint(model, P[g,T] - P[g,1] <= ramp_rate[g])
+        end
+    end
+
+    optimize!(model)
+
+    return (
+        cost = objective_value(model),
+        P = value.(P),
+        u = value.(u),
+        v = value.(v),
+        w = value.(w),
+        wind_dispatch = value.(wind_dispatch),
+        wind_curtail = value.(wind_curtail),
+        model = model
+    )
+end
+
+# ---------------------------------------------------------------------------
+# PRICE EXTRACTION
+function get_prices(result)
+    ufix = round.(Int, value.(result.u))
+
+    lp = Model(Gurobi.Optimizer)
+    set_optimizer_attribute(lp, "OutputFlag", 0)
+
+    @variable(lp, P[1:n_gen, 1:T] >= 0)
+    @variable(lp, 0 <= wind_dispatch[1:T] <= wind_capacity)
+    @variable(lp, wind_curtail[1:T] >= 0)
+
+    @objective(lp, Min, sum(mc[g] * P[g,t] for g=1:n_gen, t=1:T))
+
+    @constraint(lp, balance_lp[t=1:T],
+        sum(P[g,t] for g in 1:n_gen) + wind_dispatch[t] == demand[t]
+    )
+
+    for g in 1:n_gen, t in 1:T
+        @constraint(lp, P[g,t] <= P_max[g] * ufix[g,t])
+        @constraint(lp, P[g,t] >= P_min[g] * ufix[g,t])
+    end
+
+    @constraint(lp, [t=1:T],
+        wind_dispatch[t] + wind_curtail[t] == wind_available[t]
+    )
+
+    optimize!(lp)
+
+    return dual.(balance_lp)
+end
+
+# ---------------------------------------------------------------------------
+# RUN MODELS
+println("\nSolving WITHOUT ramping constraints...")
+result_no_ramp = solve_dispatch(false)
+
+println("Solving WITH ramping constraints...")
+result_with_ramp = solve_dispatch(true)
+
+# ---------------------------------------------------------------------------
+# REPORT RESULTS
+println("\n" * "="^70)
+println("RESULTS")
+println("="^70)
+print("Total cost without ramping = \$")
+println(round(result_no_ramp.cost, digits=2))
+print("Total cost with ramping    = \$")
+println(round(result_with_ramp.cost, digits=2))
+print("Cost increase due to ramping = \$")
+println(round(result_with_ramp.cost - result_no_ramp.cost, digits=2))
+
+total_wind = sum(wind_available)
+curt_no = sum(result_no_ramp.wind_curtail)
+curt_wr = sum(result_with_ramp.wind_curtail)
+
+println("\nWind Energy:")
+print("  Total available = ")
+print(round(total_wind, digits=2))
+println(" MWh")
+print("  Curtailment (no ramp)  = ")
+print(round(curt_no, digits=2))
+print(" MWh (")
+print(round(100*curt_no/total_wind, digits=2))
+println("%)")
+print("  Curtailment (with ramp)= ")
+print(round(curt_wr, digits=2))
+print(" MWh (")
+print(round(100*curt_wr/total_wind, digits=2))
+println("%)")
+
+# Prices
+prices_no = get_prices(result_no_ramp)
+prices_wr = get_prices(result_with_ramp)
+
+println("\nAverage Prices:")
+print("  Without ramping = \$")
+print(round(mean(prices_no), digits=2))
+println("/MWh")
+print("  With ramping    = \$")
+print(round(mean(prices_wr), digits=2))
+println("/MWh")
+
+# Debug: Check if prices are actually different
+if prices_no ≈ prices_wr
+    println("\n⚠️  WARNING: Prices are identical or very similar!")
+    println("  This may indicate an issue with price extraction.")
+else
+    println("\n✓ Prices differ between scenarios (as expected)")
+end
+
+# Debug: Print some generator commitment patterns
+println("\nGenerator Commitment (u) - First 8 hours:")
+u_no = round.(Int, value.(result_no_ramp.u))
+u_wr = round.(Int, value.(result_with_ramp.u))
+println("Without ramping:")
+for g in 1:n_gen
+    print("  ")
+    print(thermal_data[g, "Name"])
+    print(": ")
+    println(u_no[g, 1:8])
+end
+println("With ramping:")
+for g in 1:n_gen
+    print("  ")
+    print(thermal_data[g, "Name"])
+    print(": ")
+    println(u_wr[g, 1:8])
+end
+
+# ---------------------------------------------------------------------------
+# PLOT 1: PRICE COMPARISON
+p1 = plot(1:T, prices_no, label="No ramping", linewidth=2, 
+          xlabel="Hour", ylabel="Price (\$/MWh)", 
+          title="Electricity Prices: With vs Without Ramping Constraints",
+          legend=:topright, grid=true)
+plot!(p1, 1:T, prices_wr, label="With ramping", linewidth=2)
+savefig(p1, "price_comparison.png")
+println("\nSaved: price_comparison.png")
+
+# ---------------------------------------------------------------------------
+# PLOT 2: STACKED AREA PLOT FOR DISPATCH
+function plot_dispatch(result, title_suffix)
+    P_vals = result.P
+    wind_vals = result.wind_dispatch
+    
+    # Create stacked area data
+    p = plot(xlabel="Hour", ylabel="Power (MW)", 
+             title="Generator Dispatch - $title_suffix",
+             legend=:outertopright, size=(900, 500))
+    
+    # Plot each thermal generator as stacked area
+    gen_names = thermal_data[!, "Name"]
+    for g in 1:n_gen
+        if g == 1
+            plot!(p, 1:T, P_vals[g,:], fillrange=0, 
+                  label=gen_names[g], alpha=0.7, linewidth=0)
+        else
+            cumsum_prev = sum(P_vals[1:g-1,:], dims=1)[:]
+            cumsum_curr = cumsum_prev .+ P_vals[g,:]
+            plot!(p, 1:T, cumsum_curr, fillrange=cumsum_prev,
+                  label=gen_names[g], alpha=0.7, linewidth=0)
+        end
+    end
+    
+    # Add wind on top
+    cumsum_thermal = sum(P_vals, dims=1)[:]
+    cumsum_total = cumsum_thermal .+ wind_vals
+    plot!(p, 1:T, cumsum_total, fillrange=cumsum_thermal,
+          label="Wind", alpha=0.7, linewidth=0, color=:green)
+    
+    # Add demand line
+    plot!(p, 1:T, demand, label="Demand", linewidth=2, 
+          color=:black, linestyle=:dash)
+    
+    return p
+end
+
+p2 = plot_dispatch(result_no_ramp, "Without Ramping")
+savefig(p2, "dispatch_no_ramping.png")
+println("Saved: dispatch_no_ramping.png")
+
+p3 = plot_dispatch(result_with_ramp, "With Ramping")
+savefig(p3, "dispatch_with_ramping.png")
+println("Saved: dispatch_with_ramping.png")
+
+println("\n" * "="^70)
+println("All plots saved successfully!")
+println("="^70)
