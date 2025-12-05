@@ -1,0 +1,276 @@
+using JuMP
+using Gurobi
+using CSV
+using DataFrames
+
+# Read time series data - FIXED FILENAME
+data = CSV.read("demand_vre_cf.csv", DataFrame)
+
+# Number of time periods
+T = nrow(data)  # Should be 8760
+
+# Extract time series
+load = data.load  # MW (= MWh for 1-hour periods)
+wind_cf = data.onwind
+solar_cf = data.solar
+
+# Parameters - Economic
+discount_rate = 0.07
+lifetime = 30
+CRF = (discount_rate * (1 + discount_rate)^lifetime) / ((1 + discount_rate)^lifetime - 1)
+
+# Generator parameters (converting $/kW to $/MW by multiplying by 1000)
+# Wind
+wind_capex = 1335  # $/kW
+wind_fom = 28  # $/kW/year
+wind_vom = 0  # $/MWh
+wind_ann_cost = (wind_capex * CRF + wind_fom) * 1000  # $/MW/year
+
+# Solar
+solar_capex = 895  # $/kW
+solar_fom = 15  # $/kW/year
+solar_vom = 0  # $/MWh
+solar_ann_cost = (solar_capex * CRF + solar_fom) * 1000  # $/MW/year
+
+# Gas CCGT
+gas_capex = 1343  # $/kW
+gas_fom = 30  # $/kW/year
+gas_vom = 2  # $/MWh
+heat_rate = 6.16  # MMBtu/MWh
+gas_price = 4  # $/MMBtu
+gas_fuel_cost = heat_rate * gas_price  # $/MWh
+gas_total_vom = gas_vom + gas_fuel_cost  # $/MWh
+gas_ann_cost = (gas_capex * CRF + gas_fom) * 1000  # $/MW/year
+gas_co2_intensity = heat_rate * 0.053  # tCO2/MWh
+
+# Storage parameters (converting $/kW to $/MW and $/kWh to $/MWh by multiplying by 1000)
+# Li-ion
+liion_capex_power = 257  # $/kW
+liion_fom_power = 6.4  # $/kW/year
+liion_capex_energy = 277  # $/kWh
+liion_fom_energy = 6.9  # $/kWh/year
+liion_vom = 1  # $/MWh
+liion_ann_cost_power = (liion_capex_power * CRF + liion_fom_power) * 1000  # $/MW/year
+liion_ann_cost_energy = (liion_capex_energy * CRF + liion_fom_energy) * 1000  # $/MWh/year
+liion_charge_eff = 0.92
+liion_discharge_eff = 0.92
+liion_self_discharge = 0.001  # per hour
+liion_min_soc = 0.05
+liion_max_soc = 0.95
+liion_min_duration = 1  # hours
+liion_max_duration = 10  # hours
+
+# Metal-air
+metalair_capex_power = 1100  # $/kW
+metalair_fom_power = 27.5  # $/kW/year
+metalair_capex_energy = 10  # $/kWh
+metalair_fom_energy = 0.25  # $/kWh/year
+metalair_vom = 1  # $/MWh
+metalair_ann_cost_power = (metalair_capex_power * CRF + metalair_fom_power) * 1000  # $/MW/year
+metalair_ann_cost_energy = (metalair_capex_energy * CRF + metalair_fom_energy) * 1000  # $/MWh/year
+metalair_charge_eff = 0.72
+metalair_discharge_eff = 0.59
+metalair_self_discharge = 0.01  # per hour
+metalair_min_soc = 0.05
+metalair_max_soc = 0.95
+metalair_min_duration = 10  # hours
+metalair_max_duration = 150  # hours
+
+# Load shedding cost
+load_shed_cost = 5000  # $/MWh
+
+# Emissions budget
+E_budget = 1e6  # tCO2/year
+
+# Create optimization model
+model = Model(Gurobi.Optimizer)
+
+# Decision variables
+# Generation capacity (MW)
+@variable(model, C_wind >= 0)
+@variable(model, C_solar >= 0)
+@variable(model, C_gas >= 0)
+
+# Storage capacity
+@variable(model, C_liion_P >= 0)  # MW
+@variable(model, C_liion_E >= 0)  # MWh
+@variable(model, C_metalair_P >= 0)
+@variable(model, C_metalair_E >= 0)
+
+# Hourly generation (MWh)
+@variable(model, y_wind[1:T] >= 0)
+@variable(model, y_solar[1:T] >= 0)
+@variable(model, y_gas[1:T] >= 0)
+
+# Storage operations
+@variable(model, PC_liion[1:T] >= 0)  # Charging (MW)
+@variable(model, PD_liion[1:T] >= 0)  # Discharging (MW)
+@variable(model, S_liion[1:T] >= 0)   # State of charge (MWh)
+
+@variable(model, PC_metalair[1:T] >= 0)
+@variable(model, PD_metalair[1:T] >= 0)
+@variable(model, S_metalair[1:T] >= 0)
+
+# Load shedding
+@variable(model, LS[1:T] >= 0)
+
+# Objective function
+@objective(model, Min,
+    # Annualized capital costs
+    wind_ann_cost * C_wind +
+    solar_ann_cost * C_solar +
+    gas_ann_cost * C_gas +
+    liion_ann_cost_power * C_liion_P +
+    liion_ann_cost_energy * C_liion_E +
+    metalair_ann_cost_power * C_metalair_P +
+    metalair_ann_cost_energy * C_metalair_E +
+    # Operating costs
+    sum(wind_vom * y_wind[t] + 
+        solar_vom * y_solar[t] + 
+        gas_total_vom * y_gas[t] +
+        liion_vom * (PC_liion[t] + PD_liion[t]) +
+        metalair_vom * (PC_metalair[t] + PD_metalair[t]) +
+        load_shed_cost * LS[t]
+        for t in 1:T)
+)
+
+# Constraints
+
+# 1. Supply-demand balance
+@constraint(model, balance[t in 1:T],
+    y_wind[t] + y_solar[t] + y_gas[t] + 
+    PD_liion[t] + PD_metalair[t] - 
+    PC_liion[t] - PC_metalair[t] + 
+    LS[t] == load[t]
+)
+
+# 2. Generation capacity limits
+@constraint(model, wind_cap[t in 1:T],
+    y_wind[t] <= wind_cf[t] * C_wind
+)
+
+@constraint(model, solar_cap[t in 1:T],
+    y_solar[t] <= solar_cf[t] * C_solar
+)
+
+@constraint(model, gas_cap[t in 1:T],
+    y_gas[t] <= C_gas
+)
+
+# 3. Storage power limits
+@constraint(model, liion_power[t in 1:T],
+    PC_liion[t] + PD_liion[t] <= C_liion_P
+)
+
+@constraint(model, metalair_power[t in 1:T],
+    PC_metalair[t] + PD_metalair[t] <= C_metalair_P
+)
+
+# 4. Storage SOC limits
+@constraint(model, liion_soc_min[t in 1:T],
+    S_liion[t] >= liion_min_soc * C_liion_E
+)
+
+@constraint(model, liion_soc_max[t in 1:T],
+    S_liion[t] <= liion_max_soc * C_liion_E
+)
+
+@constraint(model, metalair_soc_min[t in 1:T],
+    S_metalair[t] >= metalair_min_soc * C_metalair_E
+)
+
+@constraint(model, metalair_soc_max[t in 1:T],
+    S_metalair[t] <= metalair_max_soc * C_metalair_E
+)
+
+# 5. Storage inventory balance
+# Li-ion
+@constraint(model, liion_balance_first,
+    S_liion[1] == (1 - liion_self_discharge) * S_liion[T] + 
+                   liion_charge_eff * PC_liion[1] - 
+                   PD_liion[1] / liion_discharge_eff
+)
+
+@constraint(model, liion_balance[t in 2:T],
+    S_liion[t] == (1 - liion_self_discharge) * S_liion[t-1] + 
+                   liion_charge_eff * PC_liion[t] - 
+                   PD_liion[t] / liion_discharge_eff
+)
+
+# Metal-air
+@constraint(model, metalair_balance_first,
+    S_metalair[1] == (1 - metalair_self_discharge) * S_metalair[T] + 
+                      metalair_charge_eff * PC_metalair[1] - 
+                      PD_metalair[1] / metalair_discharge_eff
+)
+
+@constraint(model, metalair_balance[t in 2:T],
+    S_metalair[t] == (1 - metalair_self_discharge) * S_metalair[t-1] + 
+                      metalair_charge_eff * PC_metalair[t] - 
+                      PD_metalair[t] / metalair_discharge_eff
+)
+
+# 6. Energy-to-power ratio
+@constraint(model, liion_duration_min,
+    C_liion_E >= liion_min_duration * C_liion_P
+)
+
+@constraint(model, liion_duration_max,
+    C_liion_E <= liion_max_duration * C_liion_P
+)
+
+@constraint(model, metalair_duration_min,
+    C_metalair_E >= metalair_min_duration * C_metalair_P
+)
+
+@constraint(model, metalair_duration_max,
+    C_metalair_E <= metalair_max_duration * C_metalair_P
+)
+
+# 7. Emissions constraint
+@constraint(model, emissions,
+    sum(gas_co2_intensity * y_gas[t] for t in 1:T) <= E_budget
+)
+
+# Solve
+println("Starting optimization...")
+println("Model has $(num_variables(model)) variables and $(num_constraints(model; count_variable_in_set_constraints=true)) constraints")
+
+optimize!(model)
+
+# Display results
+println("\n=== OPTIMIZATION RESULTS ===\n")
+println("Solver Status: ", termination_status(model))
+println("Objective Value: \$", round(objective_value(model)/1e6, digits=2), " million")
+
+println("\n--- Installed Capacity (MW) ---")
+println("Wind: ", round(value(C_wind), digits=2))
+println("Solar: ", round(value(C_solar), digits=2))
+println("Gas CCGT: ", round(value(C_gas), digits=2))
+
+println("\n--- Storage Capacity ---")
+println("Li-ion Power: ", round(value(C_liion_P), digits=2), " MW")
+println("Li-ion Energy: ", round(value(C_liion_E), digits=2), " MWh")
+if value(C_liion_P) > 0.01
+    println("Li-ion Duration: ", round(value(C_liion_E)/value(C_liion_P), digits=2), " hours")
+end
+println("Metal-air Power: ", round(value(C_metalair_P), digits=2), " MW")
+println("Metal-air Energy: ", round(value(C_metalair_E), digits=2), " MWh")
+if value(C_metalair_P) > 0.01
+    println("Metal-air Duration: ", round(value(C_metalair_E)/value(C_metalair_P), digits=2), " hours")
+end
+
+println("\n--- Annual Statistics ---")
+total_gen = sum(value.(y_wind) .+ value.(y_solar) .+ value.(y_gas))
+wind_gen = sum(value.(y_wind))
+solar_gen = sum(value.(y_solar))
+gas_gen = sum(value.(y_gas))
+total_load_shed = sum(value.(LS))
+total_emissions = gas_co2_intensity * gas_gen
+
+println("Total Generation: ", round(total_gen, digits=2), " MWh")
+println("Wind Generation: ", round(wind_gen, digits=2), " MWh (", round(100*wind_gen/total_gen, digits=1), "%)")
+println("Solar Generation: ", round(solar_gen, digits=2), " MWh (", round(100*solar_gen/total_gen, digits=1), "%)")
+println("Gas Generation: ", round(gas_gen, digits=2), " MWh (", round(100*gas_gen/total_gen, digits=1), "%)")
+println("Total Load Shedding: ", round(total_load_shed, digits=2), " MWh (", round(100*total_load_shed/sum(load), digits=3), "% of demand)")
+println("Total Emissions: ", round(total_emissions, digits=2), " tCO2 (", round(100*total_emissions/E_budget, digits=1), "% of budget)")

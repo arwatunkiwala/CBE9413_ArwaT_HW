@@ -1,0 +1,383 @@
+using JuMP
+using Gurobi
+using CSV
+using DataFrames
+using Statistics
+using Random
+using Clustering
+using Distances
+
+# Read time series data
+data = CSV.read("demand_vre_cf.csv", DataFrame)
+
+# === PART D: K-MEANS CLUSTERING ===
+
+# Extract hourly time series
+load_hourly = data.load
+wind_cf_hourly = data.onwind
+solar_cf_hourly = data.solar
+
+# Reshape into days (365 days × 24 hours)
+n_days = 365
+hours_per_day = 24
+
+load_days = reshape(load_hourly[1:n_days*hours_per_day], hours_per_day, n_days)'
+wind_days = reshape(wind_cf_hourly[1:n_days*hours_per_day], hours_per_day, n_days)'
+solar_days = reshape(solar_cf_hourly[1:n_days*hours_per_day], hours_per_day, n_days)'
+
+# Normalize load to be similar magnitude as capacity factors
+# This is critical for good clustering!
+load_normalized = load_days ./ maximum(load_days)
+
+# Create feature matrix for clustering (365 days × 72 features)
+# Each day has: 24 load values + 24 wind CF + 24 solar CF = 72 features
+X = hcat(load_normalized, wind_days, solar_days)  # 365 × 72
+
+# Transpose for Clustering.jl format (features × samples)
+X_transpose = X'  # 72 × 365
+
+println("Feature matrix shape: ", size(X))
+println("Running k-means clustering...")
+
+# Function to find representative day (closest to centroid)
+function find_representative_days(X, assignments, centers, K)
+    rep_days = zeros(Int, K)
+    for k in 1:K
+        cluster_indices = findall(assignments .== k)
+        if length(cluster_indices) > 0
+            # Find day closest to centroid
+            distances = [euclidean(X[i, :], centers[:, k]) for i in cluster_indices]
+            rep_days[k] = cluster_indices[argmin(distances)]
+        end
+    end
+    return rep_days
+end
+
+# Solve for K = 10 and K = 20
+K_values = [10, 20]
+results_dict = Dict()
+
+for K in K_values
+    println("\n" * "="^60)
+    println("K-MEANS WITH K = $K CLUSTERS")
+    println("="^60)
+    
+    # Perform k-means with 100 random initializations using Clustering.jl
+    best_result = nothing
+    best_cost = Inf
+    
+    for init in 1:100
+        Random.seed!(init)
+        result = kmeans(X_transpose, K; maxiter=100, display=:none)
+        if result.totalcost < best_cost
+            best_cost = result.totalcost
+            best_result = result
+        end
+    end
+    
+    println("Total cost (inertia): ", round(best_cost, digits=2))
+    
+    # Extract results
+    assignments = best_result.assignments  # Cluster assignment for each day
+    centers = best_result.centers          # Cluster centers (72 × K)
+    
+    # Find representative days
+    rep_days = find_representative_days(X, assignments, centers, K)
+    
+    # Calculate cluster weights (number of days in each cluster)
+    weights = [sum(assignments .== k) for k in 1:K]
+    
+    println("\nCluster sizes:")
+    for k in 1:K
+        println("  Cluster $k: $(weights[k]) days, rep day: $(rep_days[k])")
+    end
+    
+    # Verify all days are assigned
+    println("Total days assigned: ", sum(weights))
+    
+    # Extract representative day time series
+    rep_load = load_days[rep_days, :]      # K × 24
+    rep_wind = wind_days[rep_days, :]      # K × 24
+    rep_solar = solar_days[rep_days, :]    # K × 24
+    
+    # Scale demand so weighted sum matches annual demand
+    total_annual_demand = sum(load_hourly)
+    current_weighted_demand = sum(weights[k] * sum(rep_load[k, :]) for k in 1:K)
+    scaling_factor = total_annual_demand / current_weighted_demand
+    
+    println("\nDemand scaling factor: ", round(scaling_factor, digits=4))
+    println("Original annual demand: ", round(total_annual_demand, digits=2), " MWh")
+    println("Scaled annual demand: ", round(scaling_factor * current_weighted_demand, digits=2), " MWh")
+    
+    rep_load_scaled = rep_load .* scaling_factor
+    
+    # Create expanded time series for optimization (K days × 24 hours)
+    T_rep = K * hours_per_day
+    
+    load_rep = vec(rep_load_scaled')      # Flatten to 1D vector
+    wind_cf_rep = vec(rep_wind')
+    solar_cf_rep = vec(rep_solar')
+    
+    # Create weight vector for each hour
+    weights_hourly = repeat(weights, inner=hours_per_day)  # Repeat each weight 24 times
+    
+    # Parameters - Economic
+    discount_rate = 0.07
+    lifetime = 30
+    CRF = (discount_rate * (1 + discount_rate)^lifetime) / ((1 + discount_rate)^lifetime - 1)
+    
+    # Generator parameters
+    wind_capex = 1335; wind_fom = 28; wind_vom = 0
+    wind_ann_cost = (wind_capex * CRF + wind_fom) * 1000
+    
+    solar_capex = 895; solar_fom = 15; solar_vom = 0
+    solar_ann_cost = (solar_capex * CRF + solar_fom) * 1000
+    
+    gas_capex = 1343; gas_fom = 30; gas_vom = 2
+    heat_rate = 6.16; gas_price = 4
+    gas_fuel_cost = heat_rate * gas_price
+    gas_total_vom = gas_vom + gas_fuel_cost
+    gas_ann_cost = (gas_capex * CRF + gas_fom) * 1000
+    gas_co2_intensity = heat_rate * 0.053
+    
+    # Storage parameters
+    liion_capex_power = 257; liion_fom_power = 6.4
+    liion_capex_energy = 277; liion_fom_energy = 6.9; liion_vom = 1
+    liion_ann_cost_power = (liion_capex_power * CRF + liion_fom_power) * 1000
+    liion_ann_cost_energy = (liion_capex_energy * CRF + liion_fom_energy) * 1000
+    liion_charge_eff = 0.92; liion_discharge_eff = 0.92
+    liion_self_discharge = 0.001
+    liion_min_soc = 0.05; liion_max_soc = 0.95
+    liion_min_duration = 1; liion_max_duration = 10
+    
+    metalair_capex_power = 1100; metalair_fom_power = 27.5
+    metalair_capex_energy = 10; metalair_fom_energy = 0.25; metalair_vom = 1
+    metalair_ann_cost_power = (metalair_capex_power * CRF + metalair_fom_power) * 1000
+    metalair_ann_cost_energy = (metalair_capex_energy * CRF + metalair_fom_energy) * 1000
+    metalair_charge_eff = 0.72; metalair_discharge_eff = 0.59
+    metalair_self_discharge = 0.01
+    metalair_min_soc = 0.05; metalair_max_soc = 0.95
+    metalair_min_duration = 10; metalair_max_duration = 150
+    
+    load_shed_cost = 5000
+    E_budget = 1e6
+    
+    # Create optimization model
+    model = Model(Gurobi.Optimizer)
+    
+    # Decision variables
+    @variable(model, C_wind >= 0)
+    @variable(model, C_solar >= 0)
+    @variable(model, C_gas >= 0)
+    @variable(model, C_liion_P >= 0)
+    @variable(model, C_liion_E >= 0)
+    @variable(model, C_metalair_P >= 0)
+    @variable(model, C_metalair_E >= 0)
+    
+    @variable(model, y_wind[1:T_rep] >= 0)
+    @variable(model, y_solar[1:T_rep] >= 0)
+    @variable(model, y_gas[1:T_rep] >= 0)
+    @variable(model, PC_liion[1:T_rep] >= 0)
+    @variable(model, PD_liion[1:T_rep] >= 0)
+    @variable(model, S_liion[1:T_rep] >= 0)
+    @variable(model, PC_metalair[1:T_rep] >= 0)
+    @variable(model, PD_metalair[1:T_rep] >= 0)
+    @variable(model, S_metalair[1:T_rep] >= 0)
+    @variable(model, LS[1:T_rep] >= 0)
+    
+    # MODIFIED OBJECTIVE: Weight each hour by cluster size
+    @objective(model, Min,
+        # Annualized capital costs
+        wind_ann_cost * C_wind +
+        solar_ann_cost * C_solar +
+        gas_ann_cost * C_gas +
+        liion_ann_cost_power * C_liion_P +
+        liion_ann_cost_energy * C_liion_E +
+        metalair_ann_cost_power * C_metalair_P +
+        metalair_ann_cost_energy * C_metalair_E +
+        # Operating costs (weighted by cluster size)
+        sum(weights_hourly[t] * (
+            wind_vom * y_wind[t] + 
+            solar_vom * y_solar[t] + 
+            gas_total_vom * y_gas[t] +
+            liion_vom * (PC_liion[t] + PD_liion[t]) +
+            metalair_vom * (PC_metalair[t] + PD_metalair[t]) +
+            load_shed_cost * LS[t]
+        ) for t in 1:T_rep)
+    )
+    
+    # Constraints
+    
+    # 1. Supply-demand balance
+    @constraint(model, balance[t in 1:T_rep],
+        y_wind[t] + y_solar[t] + y_gas[t] + 
+        PD_liion[t] + PD_metalair[t] - 
+        PC_liion[t] - PC_metalair[t] + 
+        LS[t] == load_rep[t]
+    )
+    
+    # 2. Generation capacity limits
+    @constraint(model, wind_cap[t in 1:T_rep],
+        y_wind[t] <= wind_cf_rep[t] * C_wind
+    )
+    
+    @constraint(model, solar_cap[t in 1:T_rep],
+        y_solar[t] <= solar_cf_rep[t] * C_solar
+    )
+    
+    @constraint(model, gas_cap[t in 1:T_rep],
+        y_gas[t] <= C_gas
+    )
+    
+    # 3. Storage power limits
+    @constraint(model, liion_power[t in 1:T_rep],
+        PC_liion[t] + PD_liion[t] <= C_liion_P
+    )
+    
+    @constraint(model, metalair_power[t in 1:T_rep],
+        PC_metalair[t] + PD_metalair[t] <= C_metalair_P
+    )
+    
+    # 4. Storage SOC limits
+    @constraint(model, liion_soc_min[t in 1:T_rep],
+        S_liion[t] >= liion_min_soc * C_liion_E
+    )
+    
+    @constraint(model, liion_soc_max[t in 1:T_rep],
+        S_liion[t] <= liion_max_soc * C_liion_E
+    )
+    
+    @constraint(model, metalair_soc_min[t in 1:T_rep],
+        S_metalair[t] >= metalair_min_soc * C_metalair_E
+    )
+    
+    @constraint(model, metalair_soc_max[t in 1:T_rep],
+        S_metalair[t] <= metalair_max_soc * C_metalair_E
+    )
+    
+    # 5. Storage inventory balance
+    # Within each representative day (cyclic within day)
+    for day in 1:K
+        t_start = (day - 1) * hours_per_day + 1
+        t_end = day * hours_per_day
+        
+        # First hour of the day (cyclic within day)
+        @constraint(model,
+            S_liion[t_start] == (1 - liion_self_discharge) * S_liion[t_end] + 
+                                liion_charge_eff * PC_liion[t_start] - 
+                                PD_liion[t_start] / liion_discharge_eff
+        )
+        
+        @constraint(model,
+            S_metalair[t_start] == (1 - metalair_self_discharge) * S_metalair[t_end] + 
+                                   metalair_charge_eff * PC_metalair[t_start] - 
+                                   PD_metalair[t_start] / metalair_discharge_eff
+        )
+        
+        # Remaining hours
+        for t in (t_start+1):t_end
+            @constraint(model,
+                S_liion[t] == (1 - liion_self_discharge) * S_liion[t-1] + 
+                              liion_charge_eff * PC_liion[t] - 
+                              PD_liion[t] / liion_discharge_eff
+            )
+            
+            @constraint(model,
+                S_metalair[t] == (1 - metalair_self_discharge) * S_metalair[t-1] + 
+                                 metalair_charge_eff * PC_metalair[t] - 
+                                 PD_metalair[t] / metalair_discharge_eff
+            )
+        end
+    end
+    
+    # 6. Energy-to-power ratio
+    @constraint(model, liion_duration_min,
+        C_liion_E >= liion_min_duration * C_liion_P
+    )
+    
+    @constraint(model, liion_duration_max,
+        C_liion_E <= liion_max_duration * C_liion_P
+    )
+    
+    @constraint(model, metalair_duration_min,
+        C_metalair_E >= metalair_min_duration * C_metalair_P
+    )
+    
+    @constraint(model, metalair_duration_max,
+        C_metalair_E <= metalair_max_duration * C_metalair_P
+    )
+    
+    # 7. EMISSIONS CONSTRAINT (weighted by cluster size)
+    @constraint(model, emissions,
+        sum(weights_hourly[t] * gas_co2_intensity * y_gas[t] for t in 1:T_rep) <= E_budget
+    )
+    
+    # Solve
+    println("\nStarting optimization for K=$K...")
+    println("Model has $(num_variables(model)) variables and $(num_constraints(model; count_variable_in_set_constraints=true)) constraints")
+    
+    optimize!(model)
+    
+    # Display results
+    println("\n=== OPTIMIZATION RESULTS (Part D, K=$K) ===\n")
+    println("Solver Status: ", termination_status(model))
+    println("Objective Value: \$", round(objective_value(model)/1e6, digits=2), " million")
+    
+    println("\n--- Installed Capacity (MW) ---")
+    C_wind_val = value(C_wind)
+    C_solar_val = value(C_solar)
+    C_gas_val = value(C_gas)
+    println("Wind: ", round(C_wind_val, digits=2))
+    println("Solar: ", round(C_solar_val, digits=2))
+    println("Gas CCGT: ", round(C_gas_val, digits=2))
+    
+    println("\n--- Storage Capacity ---")
+    C_liion_P_val = value(C_liion_P)
+    C_liion_E_val = value(C_liion_E)
+    C_metalair_P_val = value(C_metalair_P)
+    C_metalair_E_val = value(C_metalair_E)
+    
+    println("Li-ion Power: ", round(C_liion_P_val, digits=2), " MW")
+    println("Li-ion Energy: ", round(C_liion_E_val, digits=2), " MWh")
+    if C_liion_P_val > 0.01
+        println("Li-ion Duration: ", round(C_liion_E_val/C_liion_P_val, digits=2), " hours")
+    end
+    println("Metal-air Power: ", round(C_metalair_P_val, digits=2), " MW")
+    println("Metal-air Energy: ", round(C_metalair_E_val, digits=2), " MWh")
+    if C_metalair_P_val > 0.01
+        println("Metal-air Duration: ", round(C_metalair_E_val/C_metalair_P_val, digits=2), " hours")
+    end
+    
+    println("\n--- Annual Statistics (Extrapolated) ---")
+    wind_gen = sum(weights_hourly[t] * value(y_wind[t]) for t in 1:T_rep)
+    solar_gen = sum(weights_hourly[t] * value(y_solar[t]) for t in 1:T_rep)
+    gas_gen = sum(weights_hourly[t] * value(y_gas[t]) for t in 1:T_rep)
+    total_gen = wind_gen + solar_gen + gas_gen
+    total_load_shed = sum(weights_hourly[t] * value(LS[t]) for t in 1:T_rep)
+    total_emissions = gas_co2_intensity * gas_gen
+    
+    println("Total Generation: ", round(total_gen, digits=2), " MWh")
+    println("Wind Generation: ", round(wind_gen, digits=2), " MWh (", round(100*wind_gen/total_gen, digits=1), "%)")
+    println("Solar Generation: ", round(solar_gen, digits=2), " MWh (", round(100*solar_gen/total_gen, digits=1), "%)")
+    println("Gas Generation: ", round(gas_gen, digits=2), " MWh (", round(100*gas_gen/total_gen, digits=1), "%)")
+    println("Total Load Shedding: ", round(total_load_shed, digits=2), " MWh (", round(100*total_load_shed/total_annual_demand, digits=3), "% of demand)")
+    println("Total Emissions: ", round(total_emissions, digits=2), " tCO2 (", round(100*total_emissions/E_budget, digits=1), "% of budget)")
+    
+    # Store results
+    results_dict[K] = Dict(
+        "C_wind" => C_wind_val,
+        "C_solar" => C_solar_val,
+        "C_gas" => C_gas_val,
+        "C_liion_P" => C_liion_P_val,
+        "C_liion_E" => C_liion_E_val,
+        "C_metalair_P" => C_metalair_P_val,
+        "C_metalair_E" => C_metalair_E_val,
+        "objective" => objective_value(model),
+        "n_vars" => num_variables(model),
+        "n_constraints" => num_constraints(model; count_variable_in_set_constraints=true)
+    )
+end
+
+println("\n" * "="^60)
+println("PART D COMPLETE")
+println("="^60)

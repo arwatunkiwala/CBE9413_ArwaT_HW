@@ -1,0 +1,304 @@
+using JuMP
+using Gurobi
+using CSV
+using DataFrames
+using Statistics
+
+# Read time series data
+data = CSV.read("demand_vre_cf.csv", DataFrame)
+
+# === PART C: 3-HOUR AGGREGATION ===
+
+# Function to aggregate to 3-hour periods
+function aggregate_3hour(timeseries)
+    n_periods = div(length(timeseries), 3)
+    aggregated = zeros(n_periods)
+    for i in 1:n_periods
+        idx_start = (i-1)*3 + 1
+        idx_end = i*3
+        aggregated[i] = mean(timeseries[idx_start:idx_end])
+    end
+    return aggregated
+end
+
+# Aggregate time series data
+load_3h = aggregate_3hour(data.load)
+wind_cf_3h = aggregate_3hour(data.onwind)
+solar_cf_3h = aggregate_3hour(data.solar)
+
+T_3h = length(load_3h)  # Should be 2920
+println("Number of 3-hour periods: ", T_3h)
+
+# Time step duration (hours)
+dt = 3  # Each period represents 3 hours
+
+# Parameters - Economic (same as Part B)
+discount_rate = 0.07
+lifetime = 30
+CRF = (discount_rate * (1 + discount_rate)^lifetime) / ((1 + discount_rate)^lifetime - 1)
+
+# Generator parameters
+wind_capex = 1335; wind_fom = 28; wind_vom = 0
+wind_ann_cost = (wind_capex * CRF + wind_fom) * 1000
+
+solar_capex = 895; solar_fom = 15; solar_vom = 0
+solar_ann_cost = (solar_capex * CRF + solar_fom) * 1000
+
+gas_capex = 1343; gas_fom = 30; gas_vom = 2
+heat_rate = 6.16; gas_price = 4
+gas_fuel_cost = heat_rate * gas_price
+gas_total_vom = gas_vom + gas_fuel_cost
+gas_ann_cost = (gas_capex * CRF + gas_fom) * 1000
+gas_co2_intensity = heat_rate * 0.053
+
+# Storage parameters
+liion_capex_power = 257; liion_fom_power = 6.4
+liion_capex_energy = 277; liion_fom_energy = 6.9; liion_vom = 1
+liion_ann_cost_power = (liion_capex_power * CRF + liion_fom_power) * 1000
+liion_ann_cost_energy = (liion_capex_energy * CRF + liion_fom_energy) * 1000
+liion_charge_eff = 0.92; liion_discharge_eff = 0.92
+liion_self_discharge = 0.001  # per hour
+liion_min_soc = 0.05; liion_max_soc = 0.95
+liion_min_duration = 1; liion_max_duration = 10
+
+metalair_capex_power = 1100; metalair_fom_power = 27.5
+metalair_capex_energy = 10; metalair_fom_energy = 0.25; metalair_vom = 1
+metalair_ann_cost_power = (metalair_capex_power * CRF + metalair_fom_power) * 1000
+metalair_ann_cost_energy = (metalair_capex_energy * CRF + metalair_fom_energy) * 1000
+metalair_charge_eff = 0.72; metalair_discharge_eff = 0.59
+metalair_self_discharge = 0.01  # per hour
+metalair_min_soc = 0.05; metalair_max_soc = 0.95
+metalair_min_duration = 10; metalair_max_duration = 150
+
+load_shed_cost = 5000
+E_budget = 1e6
+
+# Create optimization model
+model = Model(Gurobi.Optimizer)
+
+# Decision variables
+@variable(model, C_wind >= 0)
+@variable(model, C_solar >= 0)
+@variable(model, C_gas >= 0)
+@variable(model, C_liion_P >= 0)
+@variable(model, C_liion_E >= 0)
+@variable(model, C_metalair_P >= 0)
+@variable(model, C_metalair_E >= 0)
+
+# Operations for 3-hour periods (note: these represent MW, not MWh)
+@variable(model, y_wind[1:T_3h] >= 0)
+@variable(model, y_solar[1:T_3h] >= 0)
+@variable(model, y_gas[1:T_3h] >= 0)
+@variable(model, PC_liion[1:T_3h] >= 0)
+@variable(model, PD_liion[1:T_3h] >= 0)
+@variable(model, S_liion[1:T_3h] >= 0)
+@variable(model, PC_metalair[1:T_3h] >= 0)
+@variable(model, PD_metalair[1:T_3h] >= 0)
+@variable(model, S_metalair[1:T_3h] >= 0)
+@variable(model, LS[1:T_3h] >= 0)
+
+# MODIFIED OBJECTIVE: Multiply operating costs by dt (3 hours)
+@objective(model, Min,
+    # Annualized capital costs (unchanged)
+    wind_ann_cost * C_wind +
+    solar_ann_cost * C_solar +
+    gas_ann_cost * C_gas +
+    liion_ann_cost_power * C_liion_P +
+    liion_ann_cost_energy * C_liion_E +
+    metalair_ann_cost_power * C_metalair_P +
+    metalair_ann_cost_energy * C_metalair_E +
+    # Operating costs (MULTIPLY by dt=3 since each period is 3 hours)
+    dt * sum(wind_vom * y_wind[t] + 
+        solar_vom * y_solar[t] + 
+        gas_total_vom * y_gas[t] +
+        liion_vom * (PC_liion[t] + PD_liion[t]) +
+        metalair_vom * (PC_metalair[t] + PD_metalair[t]) +
+        load_shed_cost * LS[t]
+        for t in 1:T_3h)
+)
+
+# Constraints
+
+# 1. Supply-demand balance (load_3h is average MW over 3 hours)
+@constraint(model, balance[t in 1:T_3h],
+    y_wind[t] + y_solar[t] + y_gas[t] + 
+    PD_liion[t] + PD_metalair[t] - 
+    PC_liion[t] - PC_metalair[t] + 
+    LS[t] == load_3h[t]
+)
+
+# 2. Generation capacity limits
+@constraint(model, wind_cap[t in 1:T_3h],
+    y_wind[t] <= wind_cf_3h[t] * C_wind
+)
+
+@constraint(model, solar_cap[t in 1:T_3h],
+    y_solar[t] <= solar_cf_3h[t] * C_solar
+)
+
+@constraint(model, gas_cap[t in 1:T_3h],
+    y_gas[t] <= C_gas
+)
+
+# 3. Storage power limits
+@constraint(model, liion_power[t in 1:T_3h],
+    PC_liion[t] + PD_liion[t] <= C_liion_P
+)
+
+@constraint(model, metalair_power[t in 1:T_3h],
+    PC_metalair[t] + PD_metalair[t] <= C_metalair_P
+)
+
+# 4. Storage SOC limits
+@constraint(model, liion_soc_min[t in 1:T_3h],
+    S_liion[t] >= liion_min_soc * C_liion_E
+)
+
+@constraint(model, liion_soc_max[t in 1:T_3h],
+    S_liion[t] <= liion_max_soc * C_liion_E
+)
+
+@constraint(model, metalair_soc_min[t in 1:T_3h],
+    S_metalair[t] >= metalair_min_soc * C_metalair_E
+)
+
+@constraint(model, metalair_soc_max[t in 1:T_3h],
+    S_metalair[t] <= metalair_max_soc * C_metalair_E
+)
+
+# 5. MODIFIED STORAGE INVENTORY BALANCE
+# Self-discharge over 3 hours: (1 - η_l)^3 ≈ 1 - 3*η_l for small η_l
+# More accurate: (1 - η_l)^dt
+liion_self_discharge_3h = 1 - (1 - liion_self_discharge)^dt
+metalair_self_discharge_3h = 1 - (1 - metalair_self_discharge)^dt
+
+# Li-ion - energy changes over dt hours
+@constraint(model, liion_balance_first,
+    S_liion[1] == (1 - liion_self_discharge_3h) * S_liion[T_3h] + 
+                   dt * liion_charge_eff * PC_liion[1] - 
+                   dt * PD_liion[1] / liion_discharge_eff
+)
+
+@constraint(model, liion_balance[t in 2:T_3h],
+    S_liion[t] == (1 - liion_self_discharge_3h) * S_liion[t-1] + 
+                   dt * liion_charge_eff * PC_liion[t] - 
+                   dt * PD_liion[t] / liion_discharge_eff
+)
+
+# Metal-air
+@constraint(model, metalair_balance_first,
+    S_metalair[1] == (1 - metalair_self_discharge_3h) * S_metalair[T_3h] + 
+                      dt * metalair_charge_eff * PC_metalair[1] - 
+                      dt * PD_metalair[1] / metalair_discharge_eff
+)
+
+@constraint(model, metalair_balance[t in 2:T_3h],
+    S_metalair[t] == (1 - metalair_self_discharge_3h) * S_metalair[t-1] + 
+                      dt * metalair_charge_eff * PC_metalair[t] - 
+                      dt * PD_metalair[t] / metalair_discharge_eff
+)
+
+# 6. Energy-to-power ratio (unchanged)
+@constraint(model, liion_duration_min,
+    C_liion_E >= liion_min_duration * C_liion_P
+)
+
+@constraint(model, liion_duration_max,
+    C_liion_E <= liion_max_duration * C_liion_P
+)
+
+@constraint(model, metalair_duration_min,
+    C_metalair_E >= metalair_min_duration * C_metalair_P
+)
+
+@constraint(model, metalair_duration_max,
+    C_metalair_E <= metalair_max_duration * C_metalair_P
+)
+
+# 7. MODIFIED EMISSIONS CONSTRAINT: Multiply by dt (3 hours per period)
+@constraint(model, emissions,
+    dt * sum(gas_co2_intensity * y_gas[t] for t in 1:T_3h) <= E_budget
+)
+
+# Solve
+println("\n=== PART C: 3-HOUR AGGREGATION MODEL ===\n")
+println("Starting optimization...")
+println("Model has $(num_variables(model)) variables and $(num_constraints(model; count_variable_in_set_constraints=true)) constraints")
+
+optimize!(model)
+
+# Display results
+println("\n=== OPTIMIZATION RESULTS (Part C) ===\n")
+println("Solver Status: ", termination_status(model))
+println("Objective Value: \$", round(objective_value(model)/1e6, digits=2), " million")
+
+println("\n--- Installed Capacity (MW) ---")
+C_wind_val = value(C_wind)
+C_solar_val = value(C_solar)
+C_gas_val = value(C_gas)
+println("Wind: ", round(C_wind_val, digits=2))
+println("Solar: ", round(C_solar_val, digits=2))
+println("Gas CCGT: ", round(C_gas_val, digits=2))
+
+println("\n--- Storage Capacity ---")
+C_liion_P_val = value(C_liion_P)
+C_liion_E_val = value(C_liion_E)
+C_metalair_P_val = value(C_metalair_P)
+C_metalair_E_val = value(C_metalair_E)
+
+println("Li-ion Power: ", round(C_liion_P_val, digits=2), " MW")
+println("Li-ion Energy: ", round(C_liion_E_val, digits=2), " MWh")
+if C_liion_P_val > 0.01
+    println("Li-ion Duration: ", round(C_liion_E_val/C_liion_P_val, digits=2), " hours")
+end
+println("Metal-air Power: ", round(C_metalair_P_val, digits=2), " MW")
+println("Metal-air Energy: ", round(C_metalair_E_val, digits=2), " MWh")
+if C_metalair_P_val > 0.01
+    println("Metal-air Duration: ", round(C_metalair_E_val/C_metalair_P_val, digits=2), " hours")
+end
+
+println("\n--- Annual Statistics ---")
+# Note: multiply by dt to get MWh from MW
+wind_gen = dt * sum(value.(y_wind))
+solar_gen = dt * sum(value.(y_solar))
+gas_gen = dt * sum(value.(y_gas))
+total_gen = wind_gen + solar_gen + gas_gen
+total_load_shed = dt * sum(value.(LS))
+total_emissions = gas_co2_intensity * gas_gen
+
+println("Total Generation: ", round(total_gen, digits=2), " MWh")
+println("Wind Generation: ", round(wind_gen, digits=2), " MWh (", round(100*wind_gen/total_gen, digits=1), "%)")
+println("Solar Generation: ", round(solar_gen, digits=2), " MWh (", round(100*solar_gen/total_gen, digits=1), "%)")
+println("Gas Generation: ", round(gas_gen, digits=2), " MWh (", round(100*gas_gen/total_gen, digits=1), "%)")
+println("Total Load Shedding: ", round(total_load_shed, digits=2), " MWh (", round(100*total_load_shed/sum(data.load), digits=3), "% of demand)")
+println("Total Emissions: ", round(total_emissions, digits=2), " tCO2 (", round(100*total_emissions/E_budget, digits=1), "% of budget)")
+
+println("\n=== ANSWERS TO PART C QUESTIONS ===")
+println("\nQ: How will you modify the objective if at all?")
+println("A: YES - Operating costs must be multiplied by dt = 3 hours.")
+println("   Reason: The decision variables (y_g,t, PC, PD, LS) represent average power (MW)")
+println("   over each 3-hour period. To get total energy (MWh) and correct costs, we multiply")
+println("   by the time duration: Cost = (\$/MWh) × (MW) × (3 hours) = \$ for that period.")
+println("   Capital costs remain unchanged as they are annual costs, not time-dependent.")
+
+println("\nQ: How will you modify the storage inventory balance constraint if at all?")
+println("A: YES - Two modifications needed:")
+println("   1. Self-discharge: Use (1 - η_l)^dt = (1 - η_l)^3 instead of (1 - η_l)")
+println("      This accounts for 3 hours of self-discharge per period.")
+println("   2. Charging/Discharging: Multiply by dt = 3 hours")
+println("      S_t = (1-η_l)^3 × S_t-1 + 3×η_c×PC_t - 3×PD_t/η_d")
+println("      Reason: PC and PD are in MW (average power), so we multiply by 3 hours")
+println("      to get the energy change (MWh) in the storage over that period.")
+
+println("\nQ: How will you modify the emissions constraint if at all?")
+println("A: YES - Multiply total emissions by dt = 3 hours.")
+println("   Reason: y_gas[t] represents average power (MW) over each 3-hour period.")
+println("   To get total energy: Σ(c_e × y_gas × 3) ≤ E_budget")
+println("   This ensures we're calculating emissions based on total MWh generated,")
+println("   not just the average MW in each period.")
+
+println("\n=== Key Modifications Summary ===")
+println("1. Objective: Operating costs multiplied by dt = 3")
+println("2. Storage balance: Self-discharge is (1-η_l)^3, charging/discharging terms multiplied by dt = 3")
+println("3. Emissions: Total emissions multiplied by dt = 3")
+println("4. Time periods reduced from 8760 to ", T_3h)
